@@ -229,6 +229,8 @@ public class NativeTTS {
         this.webView = webView;
         this.appContext = activity.getApplicationContext();
         edge = new EdgeTtsEngine(this.appContext);
+        // 网速持续低于音频码率时告知网页层，由前端提示改用离线音色
+        edge.setOnSlowNetwork(() -> fire("slownet", ""));
         baidu = new BaiduTtsEngine(this.appContext);
         android.content.SharedPreferences spVoice =
                 appContext.getSharedPreferences("qingyue_tts", Context.MODE_PRIVATE);
@@ -638,6 +640,7 @@ public class NativeTTS {
             try { if (edge != null) edge.stop(); } catch (Throwable ignore) {}
             try { if (edge != null) edge.clearPrefetch(); } catch (Throwable ignore) {}   // 旧音色预取作废
             try { if (baidu != null) baidu.stop(); } catch (Throwable ignore) {}
+            try { if (baidu != null) baidu.clearPrefetch(); } catch (Throwable ignore) {}
             Log.i(TAG, "voice -> " + id);
             publishState();
         } catch (Throwable t) {
@@ -844,10 +847,15 @@ public class NativeTTS {
         if (clean.isEmpty()) { cb.onResult(true); return; }
 
         if (vid.startsWith("baidu:")) {
-            baidu.speak(clean, rate, ok -> {
-                if (ok) { cb.onResult(true); return; }
-                edgeErr = baidu.getLastError();
-                main.post(() -> systemSpeakOnce(clean, cb, token));
+            // v1.35：百度音色也带上下一段接棒，此前这里是纯单段调用，段间必然空档
+            baidu.speak(clean, nextText, rate, new BaiduTtsEngine.Callback() {
+                @Override public void onStart(long durMs) { cb.onStart(durMs); }
+
+                @Override public void onResult(boolean ok) {
+                    if (ok) { cb.onResult(true); return; }
+                    edgeErr = baidu.getLastError();
+                    main.post(() -> systemSpeakOnce(clean, cb, token));
+                }
             });
             return;
         }
@@ -1000,6 +1008,7 @@ public class NativeTTS {
         main.postDelayed(qWatchdog, 20_000);
 
         edge.clearPrefetch();            // 新的朗读会话，旧预取一律作废
+        try { if (baidu != null) baidu.clearPrefetch(); } catch (Throwable ignore) {}
 
         Log.i(TAG, "queue start: ch" + qChapter + " " + queue.size() + " 句, from " + qIndex
                 + ", 预排 " + qPending.size() + " 章");
@@ -1049,6 +1058,7 @@ public class NativeTTS {
     private static final int UNIT_TARGET = 34;        // 目标字数：凑到这么多就停
     private static final int UNIT_MAX_SENT = 5;       // 一个单元最多几句
     private static final int UNIT_MAX_CHARS = 120;    // 单次合成上限，避免长段合成过慢
+    private static final int PREFETCH_DEPTH = 4;      // 提前合成的单元数（v1.35 由 3 提到 4）
 
     /** 短句合并开关（关闭即退回一句一合成，v1.29 行为） */
     private volatile boolean joinShort = true;
@@ -1211,32 +1221,46 @@ public class NativeTTS {
      * 一段念完到下一段出声之间会空几百毫秒，听感就是明显停顿。
      * 提前合成好后，下一段直接命中缓存开播，段间几乎无缝。
      * 注意：这里必须用和 playAt 完全相同的合并规则，否则永远命不中缓存。
+     *
+     * v1.35：接入百度音色。原来只有 edge: 才预取，用百度音色的人等于完全没有预取，
+     * 每段都要现下载，弱网下停顿 1~3 秒——这是「换个音色就好了」的真正原因。
      */
     private void prefetchAhead(final int i) {
         final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
-        if (!vid.startsWith("edge:")) return;        // 百度/系统音色没有预取通道
+        final boolean isEdge = vid.startsWith("edge:");
+        final boolean isBaidu = vid.startsWith("baidu:");
+        if (!isEdge && !isBaidu) return;             // 系统语音本地合成，无需预取
         final String v = voiceShortName(vid);
-        // 一个单元通常 20~40 字（约 5~9 秒），预取 3 个就是小半分钟，够扛住网络抖动
+        // 一个单元通常 20~40 字（约 5~9 秒），预取 4 个就是半分钟上下，够扛住网络抖动
         int k = unitEnd(i);
         int n = 0;
-        while (n < 3 && k < queue.size()) {
+        while (n < PREFETCH_DEPTH && k < queue.size()) {
             int e = Math.min(unitEnd(k), queue.size());
-            edge.prefetch(unitTextIn(queue, k, e), v, rate);
+            prefetchUnit(unitTextIn(queue, k, e), v, isEdge);
             k = e;
             n++;
         }
         // 跨到下一章的前几个单元，章末切换时就不会再等合成
-        if (n < 3 && !qPending.isEmpty()) {
+        if (n < PREFETCH_DEPTH && !qPending.isEmpty()) {
             List<String> nx = qPending.get(0).s;
             int j = Math.max(0, k - queue.size());
             int m = 0;
-            while (m < 3 - n && j < nx.size()) {
+            while (m < PREFETCH_DEPTH - n && j < nx.size()) {
                 int e = Math.min(unitEndIn(nx, j), nx.size());
-                edge.prefetch(unitTextIn(nx, j, e), v, rate);
+                prefetchUnit(unitTextIn(nx, j, e), v, isEdge);
                 j = e;
                 m++;
             }
         }
+    }
+
+    /** 按当前音色投递到对应引擎的预取通道 */
+    private void prefetchUnit(String text, String voiceShort, boolean isEdge) {
+        if (text == null || text.isEmpty()) return;
+        try {
+            if (isEdge) edge.prefetch(text, voiceShort, rate);
+            else baidu.prefetch(text, rate);
+        } catch (Throwable ignore) { }
     }
 
     private volatile int qToken = 0;
@@ -1344,6 +1368,7 @@ public class NativeTTS {
             main.removeCallbacks(qTimerTick);
             stopPlaybackInternal();
             edge.clearPrefetch();          // 停止朗读后预取内容作废
+            try { if (baidu != null) baidu.clearPrefetch(); } catch (Throwable ignore) {}
             notifyProgress(true);
             evalJs("window.__ttsQueueStopped&&window.__ttsQueueStopped()");
         });
@@ -1513,7 +1538,10 @@ public class NativeTTS {
     /** 句间无缝接续开关（默认开）：关掉就退回每句重新建播放器的老行为 */
     @JavascriptInterface
     public void setSeamless(boolean on) {
-        main.post(() -> edge.setSeamless(on));
+        main.post(() -> {
+            try { edge.setSeamless(on); } catch (Throwable ignore) { }
+            try { if (baidu != null) baidu.setSeamless(on); } catch (Throwable ignore) { }
+        });
     }
 
     @JavascriptInterface

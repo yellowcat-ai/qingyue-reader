@@ -20,9 +20,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -47,6 +49,12 @@ import okhttp3.WebSocketListener;
  * 合成 → 落盘」，一段念完到下一段出声之间有几百毫秒空档，听感上是明显停顿。
  * 现在当前句播放的同时就把后两句先合成好放到内存/磁盘缓存里，下一句直接
  * 命中缓存开播，句间空档从 300~1500ms 降到几十毫秒。
+ *
+ * v1.35：缓存从「用完即删的临时文件」改成「内容寻址的持久缓存」。
+ * 文件名由 文本+音色+语速 的 hash 决定，播放完不再删，下一句没取到时
+ * 先查磁盘再决定是否重新合成；重听同一章、回退再听都是零合成。
+ * 同时把「下一句预热」从只重试一次改成小步轮询（最多 2.4 秒），
+ * 避免预取稍晚落盘就整个回落到「重新建连合成」的 1~3 秒大空档。
  */
 public class EdgeTtsEngine {
     private static final String TAG = "QingyueEdgeTts";
@@ -64,8 +72,8 @@ public class EdgeTtsEngine {
     private static final String OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
     private static final String DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural";
 
-    /** 预合成缓存上限（句）。挡住长章节缓存无限增长 */
-    private static final int READY_MAX = 10;
+    /** 内存索引上限（key → 磁盘文件）。磁盘文件另按 CACHE_MAX_FILES 裁剪，不受这个数限制 */
+    private static final int READY_MAX = 40;
 
     private final Context ctx;
     private final OkHttpClient client = new OkHttpClient.Builder()
@@ -79,12 +87,55 @@ public class EdgeTtsEngine {
 
     /** 预合成代际：clearPrefetch 时自增，作废所有在途预取请求 */
     private final AtomicInteger pseq = new AtomicInteger(0);
+    /**
+     * 预取通道（v1.36）：单线程串行 + 复用同一条 WebSocket。
+     *
+     * 原来用 3 线程池、每段新建一条 WebSocket，在弱网下有两个致命问题：
+     *
+     * 1) 并发争抢带宽。3 条连接平分瓶颈带宽，每条只拿到 1/3。实测一段约 44KB、
+     *    音频时长 7.3 秒；下行 6.71KB/s 时，3 并发平均每段只有 2.2KB/s，
+     *    下载要 20 秒，而播放只等 7.3 秒 —— 缓冲持续亏空，每段之间固定卡十几秒。
+     *    改成串行后每段独占全部带宽，下载 6.6 秒 < 播放 7.3 秒，余量为正。
+     *
+     * 2) 每段都要重新做 TLS 握手 + 传证书（约 4KB）。6.71KB/s 下这笔固定开销就是
+     *    1 秒以上，正好把串行省下来的余量吃光。实测同一条连接可以连续合成多段
+     *    （3 段连续成功），复用后只在首次和断线时付一次握手。
+     *
+     * 宽带下串行也无害：实测每段合成 500~900ms，深度 4 的缓冲 3 秒内就能填满。
+     */
+    private static final class PrefetchTask {
+        final String text, voice, key;
+        final float rate;
+        final int pseq;
+        PrefetchTask(String text, String voice, float rate, String key, int pseq) {
+            this.text = text; this.voice = voice; this.rate = rate;
+            this.key = key; this.pseq = pseq;
+        }
+    }
+
+    /** 待合成队列（预取任务，串行消费） */
+    private final LinkedBlockingQueue<PrefetchTask> pq = new LinkedBlockingQueue<>();
+    /** 复用的合成连接（仅由串行通道线程读写） */
+    private volatile WebSocket streamWs;
+    /** 合成通道消费线程 */
+    private volatile Thread streamThread;
+    /** 当前在途 turn 的完成信号（listener 在 OkHttp 线程 countDown） */
+    private volatile CountDownLatch turnLatch;
+    private volatile ByteArrayOutputStream turnAudio;
+    private volatile boolean turnOk;
+    private volatile int turnPseq = -1;
+    /** 连接序号：丢弃上一条连接关掉之后才到的迟到帧，避免串到新请求上 */
+    private final AtomicInteger connSeq = new AtomicInteger(0);
+    private volatile int curConnId = 0;
+    /** 最近一次段落吞吐（字节/秒），用于判断是否处于弱网 */
+    private final AtomicLong estBps = new AtomicLong(0);
+    /** 连续弱网段数：达到 6 段就把「网络追不上码率」的事实上报给网页 */
+    private final AtomicInteger slowStreak = new AtomicInteger(0);
+
     /** 已合成完毕、可直接播放的句子（key -> mp3 文件） */
     private final Map<String, File> ready = new ConcurrentHashMap<>();
     /** 正在预合成的 key，防止重复请求 */
     private final Set<String> inflight = ConcurrentHashMap.newKeySet();
-    /** 预合成线程池：2 条并行足够，再多容易触发服务端限流 */
-    private final ExecutorService pool = Executors.newFixedThreadPool(2);
 
     private volatile WebSocket ws;
     private volatile MediaPlayer player;
@@ -111,18 +162,21 @@ public class EdgeTtsEngine {
         cleanupCache(this.ctx);
     }
 
-    /** 每句一个临时 mp3，启动时清掉上次残留（被打断的那句不会被 onCompletion 删掉） */
+    /** 启动时清一次：旧版按代际命名的临时文件直接删，内容寻址的缓存按量裁剪。详见 TtsCache */
     private static void cleanupCache(Context ctx) {
+        TtsCache.prune(ctx);
+    }
+
+    /** 已写入的缓存文件计数，用于按批触发运行期裁剪 */
+    private final AtomicInteger cacheWrites = new AtomicInteger(0);
+
+    /** 每写 32 个缓存文件触发一次裁剪：连续朗读几十章不裁会吃掉几百 MB */
+    private void maybePruneCache() {
+        if ((cacheWrites.incrementAndGet() & 31) != 0) return;
         try {
-            File dir = ctx.getCacheDir();
-            File[] fs = dir == null ? null : dir.listFiles();
-            if (fs == null) return;
-            long now = System.currentTimeMillis();
-            for (File f : fs) {
-                String n = f.getName();
-                if (!n.startsWith("edge_tts_") && !n.startsWith("baidu_tts_")) continue;
-                if (now - f.lastModified() > 60 * 60 * 1000L) f.delete();
-            }
+            Thread t = new Thread(() -> TtsCache.prune(ctx), "tts-cache-prune");
+            t.setDaemon(true);
+            t.start();
         } catch (Throwable ignore) { }
     }
 
@@ -149,6 +203,14 @@ public class EdgeTtsEngine {
     }
 
     /**
+     * 内容寻址的缓存文件：同名 = 同文本同音色同语速，天然可以跨会话复用。
+     * 旧版按「代际 + 序号」命名，播完就删，等于每次重听都要重新合成一遍。
+     */
+    private File cacheFile(String key) {
+        return new File(ctx.getCacheDir(), "edge_tts_c" + Integer.toHexString(key.hashCode()) + ".mp3");
+    }
+
+    /**
      * 提前把某一句合成好放进缓存。播放到它时直接命中，句间就没有合成等待的停顿。
      * 失败无副作用：真正播到这句时还会走正常合成流程。
      */
@@ -159,96 +221,263 @@ public class EdgeTtsEngine {
         final String v = voiceOf(voice);
         final String key = cacheKey(clean, v, rate);
         if (ready.containsKey(key)) return;
-        if (ready.size() >= READY_MAX) return;          // 缓存满了就不再扩张
+        // 磁盘上已经有这一段（上次听过 / 刚预取完）：直接登记进索引，不再发请求
+        final File cf = cacheFile(key);
+        if (cf.exists() && cf.length() > 512) { ready.put(key, cf); return; }
         if (!inflight.add(key)) return;
         final int my = pseq.get();
         try {
-            pool.execute(() -> synthToFile(clean, v, rate, key, my));
+            ensureStreamThread();
+            pq.offer(new PrefetchTask(clean, v, rate, key, my));
         } catch (Throwable t) {
             inflight.remove(key);
         }
     }
 
-    /** 预取结果（仅供 prefetch 使用）：合成到文件，不播放 */
-    private void synthToFile(final String text, final String v, final float rate,
-                             final String key, final int my) {
-        final ByteArrayOutputStream audio = new ByteArrayOutputStream();
-        final File out = new File(ctx.getCacheDir(), "edge_tts_p" + Math.abs(key.hashCode()) + ".mp3");
-        try {
-            client.newWebSocket(buildRequest(), new WebSocketListener() {
-                @Override public void onOpen(WebSocket socket, Response response) {
-                    if (my != pseq.get()) {
-                        try { socket.close(1000, "stale"); } catch (Exception ignore) { }
-                        inflight.remove(key);
-                        return;
-                    }
-                    sendConfig(socket);
-                    sendSsml(socket, text, v, rate);
-                }
-
-                @Override public void onMessage(WebSocket socket, String t) {
-                    if (my != pseq.get()) return;
-                    if (t != null && t.contains("Path:turn.end")) {
-                        try { socket.close(1000, "done"); } catch (Exception ignore) { }
-                        storeReady(audio.toByteArray(), key, out);
-                    }
-                }
-
-                @Override public void onMessage(WebSocket socket, okio.ByteString bytes) {
-                    if (my != pseq.get()) return;
-                    collectAudio(bytes, audio);
-                }
-
-                @Override public void onFailure(WebSocket socket, Throwable t, Response response) {
-                    inflight.remove(key);
-                }
-
-                @Override public void onClosed(WebSocket socket, int code, String reason) {
-                    inflight.remove(key);
-                }
-            });
-        } catch (Throwable t) {
-            inflight.remove(key);
+    /** 懒启动串行合成通道线程（只有真正要预取时才起） */
+    private void ensureStreamThread() {
+        if (streamThread != null) return;
+        synchronized (this) {
+            if (streamThread != null) return;
+            Thread t = new Thread(this::streamLoop, "edge-synth");
+            t.setDaemon(true);
+            t.start();
+            streamThread = t;
         }
     }
 
-    private void storeReady(byte[] mp3, String key, File out) {
+    /** 串行合成通道：一次只合成一段，独占带宽，连接复用 */
+    private void streamLoop() {
+        while (true) {
+            PrefetchTask task;
+            try {
+                task = pq.poll(45, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                return;
+            }
+            if (task == null) {
+                // 空闲久了主动断开：服务端会踢空闲连接，留一条半死连接不如重连
+                closeStream();
+                continue;
+            }
+            if (task.pseq != pseq.get()) {           // 已被 clearPrefetch 作废
+                inflight.remove(task.key);
+                continue;
+            }
+            byte[] mp3 = synthSerial(task);
+            if (mp3 != null) storeReady(mp3, task.key);
+            else inflight.remove(task.key);
+        }
+    }
+
+    /** 在串行通道上合成一段；连接断了就重连重试一次 */
+    private byte[] synthSerial(PrefetchTask task) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            final long t0 = System.nanoTime();
+            WebSocket sock = ensureStream();
+            if (sock == null) continue;
+            final ByteArrayOutputStream audio = new ByteArrayOutputStream();
+            final CountDownLatch latch = new CountDownLatch(1);
+            turnAudio = audio;
+            turnOk = false;
+            turnPseq = pseq.get();
+            turnLatch = latch;
+            try {
+                if (!sendSsml(sock, task.text, task.voice, task.rate)) {
+                    // 连接已失效：立刻丢弃重连，不要等满 25 秒合成超时
+                    Log.w(TAG, "stream send failed, reconnecting");
+                    closeStream();
+                    continue;
+                }
+            } catch (Throwable t) {
+                closeStream();
+                continue;
+            }
+            boolean done;
+            try {
+                done = latch.await(25, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                done = false;
+            }
+            turnLatch = null;
+            if (done && turnOk && audio.size() > 512) {
+                recordThroughput(audio.size(), (System.nanoTime() - t0) / 1_000_000L);
+                return audio.toByteArray();
+            }
+            // 超时或连接异常：这条连接的状态不再可信，丢掉重来
+            Log.w(TAG, "synth retry, done=" + done + " ok=" + turnOk + " bytes=" + audio.size());
+            closeStream();
+        }
+        return null;
+    }
+
+    /** 拿到可用的复用连接（首次或断线后新建，并先发配置帧） */
+    private WebSocket ensureStream() {
+        WebSocket cur = streamWs;
+        if (cur != null) return cur;
+        final CountDownLatch open = new CountDownLatch(1);
+        final WebSocket[] ref = {null};
+        final int cid = connSeq.incrementAndGet();
+        client.newWebSocket(buildRequest(), new WebSocketListener() {
+            @Override public void onOpen(WebSocket socket, Response response) {
+                ref[0] = socket;
+                curConnId = cid;
+                sendConfig(socket);
+                open.countDown();
+            }
+
+            @Override public void onMessage(WebSocket socket, String t) {
+                if (cid != curConnId) return;            // 上一条连接的迟到帧
+                if (t == null || !t.contains("Path:turn.end")) return;
+                turnOk = true;
+                CountDownLatch l = turnLatch;
+                if (l != null) l.countDown();
+            }
+
+            @Override public void onMessage(WebSocket socket, okio.ByteString bytes) {
+                if (cid != curConnId) return;            // 上一条连接的迟到帧
+                if (turnPseq != pseq.get()) return;      // 已作废，别污染当前段
+                ByteArrayOutputStream out = turnAudio;
+                if (out != null) collectAudio(bytes, out);
+            }
+
+            @Override public void onFailure(WebSocket socket, Throwable t, Response response) {
+                if (streamWs == socket) streamWs = null;
+                open.countDown();
+                if (cid != curConnId) return;
+                CountDownLatch l = turnLatch;
+                if (l != null) l.countDown();
+            }
+
+            @Override public void onClosed(WebSocket socket, int code, String reason) {
+                if (streamWs == socket) streamWs = null;
+                open.countDown();
+                if (cid != curConnId) return;
+                CountDownLatch l = turnLatch;
+                if (l != null) l.countDown();
+            }
+        });
         try {
-            if (mp3 == null || mp3.length < 512) { inflight.remove(key); return; }
-            try (FileOutputStream fos = new FileOutputStream(out)) { fos.write(mp3); }
-            evictIfFull();
+            if (!open.await(15, TimeUnit.SECONDS)) return null;
+        } catch (InterruptedException e) {
+            return null;
+        }
+        WebSocket s = ref[0];
+        if (s == null) return null;
+        streamWs = s;
+        return s;
+    }
+
+    private void closeStream() {
+        WebSocket s = streamWs;
+        streamWs = null;
+        curConnId = 0;              // 旧连接的迟到回调一律失效
+        if (s != null) {
+            try { s.close(1000, "idle"); } catch (Throwable ignore) { }
+        }
+    }
+
+    /**
+     * 记录实际吞吐并判断是否处于弱网。
+     * 阈值取 48kbps 码率（约 6KB/s）的 1.25 倍：吞吐低于它意味着下载速度追不上播放速度，
+     * 无论怎么优化缓冲都会被吃空，只能建议换离线音色。
+     */
+    private void recordThroughput(int bytes, long ms) {
+        if (ms <= 0) return;
+        final long bps = bytes * 1000L / ms;
+        long prev = estBps.get();
+        estBps.set(prev == 0 ? bps : (prev * 3 + bps) / 4);      // EWMA，避免单次抖动就下结论
+        if (bps < 7500) {
+            if (slowStreak.incrementAndGet() == 6) notifySlowNetwork();
+        } else {
+            slowStreak.set(0);
+        }
+    }
+
+    /** 网速持续低于码率：告知网页层，由前端提示用户改用离线音色 */
+    private void notifySlowNetwork() {
+        try {
+            Log.w(TAG, "network below bitrate: est=" + estBps.get() + " B/s");
+            if (onSlowNetwork != null) onSlowNetwork.run();
+        } catch (Throwable ignore) { }
+    }
+
+    /** 弱网回调（NativeTTS 注入，用于向网页层推送提示） */
+    private volatile Runnable onSlowNetwork;
+    public void setOnSlowNetwork(Runnable r) { this.onSlowNetwork = r; }
+
+    private void storeReady(byte[] mp3, String key) {
+        try {
+            if (mp3 == null || mp3.length < 512) return;
+            final File out = writeAtomically(mp3, key);
+            if (out == null) return;
+            maybePruneCache();
+            trimIndex();
             ready.put(key, out);
-        } catch (Throwable t) {
-            deleteQuiet(out);
         } finally {
             inflight.remove(key);
         }
     }
 
-    /** 缓存超限时删掉最早的一份（ConcurrentHashMap 无序，取任意一个即可） */
-    private void evictIfFull() {
+    /**
+     * 只裁剪内存索引，不动磁盘文件。
+     * 磁盘文件是内容寻址的，下次 lookup 还会把它们捞回来，删了等于白合成一遍。
+     */
+    private void trimIndex() {
         if (ready.size() < READY_MAX) return;
         List<String> keys = new ArrayList<>(ready.keySet());
         for (int i = 0; i < keys.size() - READY_MAX + 1 && i < keys.size(); i++) {
-            File f = ready.remove(keys.get(i));
-            deleteQuiet(f);
+            ready.remove(keys.get(i));
         }
     }
 
-    /** 取走命中缓存的音频文件；取走后该句需要重新合成 */
-    private File takeReady(String text, String voice, float rate) {
-        File f = ready.remove(cacheKey(text, voiceOf(voice), rate));
-        if (f != null && !f.exists()) return null;
-        return f;
+    /**
+     * 取可播放的音频文件（v1.35：取用不删）。
+     * 先查内存索引，再查磁盘——磁盘命中说明上次已经合成过，直接用，零网络。
+     */
+    private File lookup(String text, String voice, float rate) {
+        final String key = cacheKey(text, voiceOf(voice), rate);
+        File f = ready.get(key);
+        if (f != null && f.exists() && f.length() > 512) return f;
+        if (f != null) ready.remove(key);                       // 索引失效，清掉
+        final File cf = cacheFile(key);
+        if (cf.exists() && cf.length() > 512) {
+            ready.put(key, cf);
+            return cf;
+        }
+        return null;
     }
 
-    /** 换队列/切换音色/停止朗读时调用：丢掉所有预取，避免用到过期的音频 */
+    /** 换队列/切换音色/停止朗读时调用：丢掉内存索引与在途预取。磁盘缓存保留，可继续复用 */
     public void clearPrefetch() {
         pseq.incrementAndGet();
+        pq.clear();                 // 排空待合成队列，作废的任务由 pseq 兜住
         inflight.clear();
-        for (File f : ready.values()) deleteQuiet(f);
         ready.clear();
+        slowStreak.set(0);
         main.post(this::releaseNxt);
+    }
+
+    /**
+     * 先写临时文件再原子改名到缓存路径。
+     * 预取线程和按需合成线程可能同时合成同一段文本，直接覆盖同一个文件会写出半截音频；
+     * 改名（Linux rename）是原子的，谁后完成谁生效，永远不会出现坏文件。
+     */
+    private File writeAtomically(byte[] mp3, String key) {
+        final File dst = cacheFile(key);
+        final File tmp = new File(ctx.getCacheDir(),
+                "edge_tts_tmp" + Integer.toHexString(key.hashCode()) + "_" + System.nanoTime() + ".mp3");
+        try {
+            try (FileOutputStream out = new FileOutputStream(tmp)) { out.write(mp3); }
+            if (!tmp.renameTo(dst)) {
+                try (FileOutputStream out = new FileOutputStream(dst)) { out.write(mp3); }
+                deleteQuiet(tmp);
+            }
+            return dst;
+        } catch (Throwable t) {
+            deleteQuiet(tmp);
+            return null;
+        }
     }
 
     /* ===================== 合成与播放 ===================== */
@@ -259,7 +488,8 @@ public class EdgeTtsEngine {
         final float rate;
         final Callback cb;
         final int my;
-        boolean nextRetried = false;
+        /** 预热轮询已尝试次数（见 prepareNext 的 NEXT_TRIES_MAX） */
+        int nextTries = 0;
         // 合成超时用：同一次 speak 可能因 403 重连，gen 每次连都递增，旧定时器自然失效
         int gen = 0;
         volatile boolean finished = false;
@@ -311,7 +541,7 @@ public class EdgeTtsEngine {
             startPrepared(j);
             return;
         }
-        File hit = takeReady(clean, voice, rate);
+        File hit = lookup(clean, voice, rate);
         if (hit != null) {
             playFile(hit, cacheKey(clean, voiceOf(voice), rate), j);
             return;
@@ -348,14 +578,17 @@ public class EdgeTtsEngine {
                 + "Path:speech.config\r\n\r\n" + cfg);
     }
 
-    /** 2) 文本帧 */
-    private static void sendSsml(WebSocket ws, String text, String voice, float rate) {
+    /**
+     * 2) 文本帧。返回 false 表示这条连接已经不可用（OkHttp 在连接关闭时 send 只返回 false
+     * 而不抛异常），调用方应立即重连，否则要白等一次合成超时。
+     */
+    private static boolean sendSsml(WebSocket ws, String text, String voice, float rate) {
         int pct = Math.round((rate - 1f) * 100);
         String ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>"
                 + "<voice name='" + voice + "'>"
                 + "<prosody pitch='+0Hz' rate='" + (pct >= 0 ? "+" : "") + pct + "%' volume='+0%'>"
                 + escapeXml(text) + "</prosody></voice></speak>";
-        ws.send("X-RequestId:" + UUID.randomUUID().toString().replace("-", "") + "\r\n"
+        return ws.send("X-RequestId:" + UUID.randomUUID().toString().replace("-", "") + "\r\n"
                 + "X-Timestamp:" + dateStr() + "\r\n"
                 + "Content-Type:application/ssml+xml\r\n"
                 + "Path:ssml\r\n\r\n" + ssml);
@@ -455,17 +688,17 @@ public class EdgeTtsEngine {
     private void playBytes(byte[] mp3, final Job j) {
         if (j.aborted || j.my != seq.get()) return;
         if (mp3 == null || mp3.length == 0) { j.cb.onResult(false); return; }
-        final File f = new File(ctx.getCacheDir(), "edge_tts_" + j.my + ".mp3");
-        try {
-            try (FileOutputStream out = new FileOutputStream(f)) {
-                out.write(mp3);
-            }
-        } catch (Throwable t) {
-            lastError = "write:" + t;
+        // v1.35：直接写成内容寻址的缓存文件，播完保留，下次同段文本零合成
+        final String key = cacheKey(j.text, voiceOf(j.voice), j.rate);
+        final File f = writeAtomically(mp3, key);
+        if (f == null) {
+            lastError = "write:failed";
             j.cb.onResult(false);
             return;
         }
-        playFile(f, cacheKey(j.text, voiceOf(j.voice), j.rate), j);
+        ready.put(key, f);
+        maybePruneCache();
+        playFile(f, key, j);
     }
 
     private void setupPlayer(MediaPlayer p, File f) throws Exception {
@@ -483,13 +716,13 @@ public class EdgeTtsEngine {
         p.setOnCompletionListener(mp -> {
             if (j.my != seq.get()) return;                // 旧句播完，不要推进队列
             releasePlayer();
-            deleteQuiet(f);
+            // v1.35：播完不删文件——它是内容寻址的缓存，重听这一段可以直接复用
             j.cb.onResult(true);
         });
         p.setOnErrorListener((mp, what, extra) -> {
             lastError = "MediaPlayer:" + what + "/" + extra;
             if (j.my == seq.get()) releasePlayer();
-            deleteQuiet(f);
+            deleteQuiet(f);                               // 打开失败多半是文件坏了，删掉让它重新合成
             if (j.my == seq.get()) j.cb.onResult(false);
             return true;
         });
@@ -497,9 +730,9 @@ public class EdgeTtsEngine {
 
     /** 播放一个已落盘的 mp3（正常合成与预取缓存共用的唯一出声入口） */
     private void playFile(final File f, final String key, final Job j) {
-        if (j.my != seq.get()) { deleteQuiet(f); return; }
+        if (j.my != seq.get()) return;
         main.post(() -> {
-            if (j.my != seq.get()) { deleteQuiet(f); return; }   // 排队期间已被切句
+            if (j.my != seq.get()) return;                  // 排队期间已被切句，文件留作缓存
             try {
                 releasePlayer();                                // 先停掉上一代，绝不允许两路同时出声
                 MediaPlayer p = new MediaPlayer();
@@ -530,7 +763,7 @@ public class EdgeTtsEngine {
             final File pf = nxtFile;
             nxt = null; nxtFile = null; nxtKey = ""; nxtGen = -1;
             if (p == null) { speakFallback(j); return; }
-            if (j.my != seq.get() || j.aborted) { releaseOne(p); deleteQuiet(pf); return; }
+            if (j.my != seq.get() || j.aborted) { releaseOne(p); return; }   // 文件留作缓存
             try {
                 if (player != null) releasePlayer();   // 上一句理论上已释放，这里是兜底：绝不允许两路同时出声
                 player = p;
@@ -552,14 +785,20 @@ public class EdgeTtsEngine {
 
     /** 预热的播放器没接上（竞态/异常）：退回正常取缓存或重新合成 */
     private void speakFallback(final Job j) {
-        File hit = takeReady(j.text, j.voice, j.rate);
+        File hit = lookup(j.text, j.voice, j.rate);
         if (hit != null) { playFile(hit, cacheKey(j.text, voiceOf(j.voice), j.rate), j); return; }
         connect(j, false);
     }
 
+    /** 预热轮询次数上限：8 次 × 250~400ms ≈ 2.4 秒，足够覆盖一次慢合成 */
+    private static final int NEXT_TRIES_MAX = 8;
+
     /**
      * 把下一句 prepare 好放在 nxt 里等接棒。
-     * 只吃已经预合成好的缓存：现去合成会跟当前这句抢带宽，反而更容易卡。
+     * 只吃已经合成好的缓存：现去合成会跟当前这句抢带宽，反而更容易卡。
+     *
+     * v1.35：没取到不再「只重试一次就放弃」，改成小步轮询到 2.4 秒。
+     * 原来预取稍晚落盘就直接退回 connect() 重新建连合成，那一段就是 1~3 秒的明显空档。
      */
     private void prepareNext(final Job j) {
         if (!seamless) return;
@@ -567,12 +806,14 @@ public class EdgeTtsEngine {
         if (nt.isEmpty()) return;
         final String nkey = cacheKey(nt, voiceOf(j.voice), j.rate);
         if (nxt != null && nkey.equals(nxtKey)) return;
-        final File f = takeReady(nt, j.voice, j.rate);
+        final File f = lookup(nt, j.voice, j.rate);
         if (f == null) {
-            // 预取可能还没落盘（刚点播放时第 2 句正在合成）：稍后再试一次
-            if (!j.nextRetried) {
-                j.nextRetried = true;
-                main.postDelayed(() -> { if (j.my == seq.get()) prepareNext(j); }, 400);
+            if (j.nextTries < NEXT_TRIES_MAX && j.my == seq.get() && !j.aborted) {
+                j.nextTries++;
+                final long delay = j.nextTries <= 4 ? 250L : 400L;
+                main.postDelayed(() -> {
+                    if (j.my == seq.get() && !j.aborted) prepareNext(j);
+                }, delay);
             }
             return;
         }
@@ -592,10 +833,8 @@ public class EdgeTtsEngine {
 
     private void releaseNxt() {
         MediaPlayer p = nxt;
-        File f = nxtFile;
         nxt = null; nxtFile = null; nxtKey = ""; nxtGen = -1;
-        if (p != null) releaseOne(p);
-        if (f != null) deleteQuiet(f);
+        if (p != null) releaseOne(p);          // 文件是磁盘缓存，不删
     }
 
     /** 起播回调（带真实音频时长），供上层按时间轴推进合并朗读的高亮 */
@@ -646,7 +885,10 @@ public class EdgeTtsEngine {
         stop();
         clearPrefetch();
         main.post(() -> { releasePlayer(); releaseNxt(); });
-        try { pool.shutdownNow(); } catch (Throwable ignore) { }
+        closeStream();
+        Thread t = streamThread;
+        streamThread = null;
+        if (t != null) t.interrupt();
     }
 
     private static String randomHex32() {

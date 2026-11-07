@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.34';
-import { settings, saveSettings } from './settings.js?v=1.34';
-import { splitSentences } from './parser.js?v=1.34';
-import { Speaker } from './tts.js?v=1.34';
+import { db, newId } from './db.js?v=1.36';
+import { settings, saveSettings } from './settings.js?v=1.36';
+import { splitSentences } from './parser.js?v=1.36';
+import { Speaker } from './tts.js?v=1.36';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -64,6 +64,14 @@ export const reader = {
       },
       onState: s => { if (this.onTtsState) this.onTtsState(s); },
       onError: m => { if (this.onToast) this.onToast(m); },
+      onSlowNet: () => {
+        // 连续多段的实际吞吐都追不上音频码率：再加深缓冲也没用，只能换不吃网络的音色
+        if (this._slowNetTold) return;      // 一次会话只提示一次，避免反复骚扰
+        this._slowNetTold = true;
+        if (this.onToast) {
+          this.onToast('网速偏慢，朗读容易卡顿。可在音色里选择「系统语音」离线朗读');
+        }
+      },
     });
 
     // 点击正文切换顶/底栏；翻页模式下左右翻页

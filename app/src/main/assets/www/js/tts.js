@@ -41,6 +41,7 @@ export class Speaker {
       onChapterEnd: async () => false, // 返回 true 表示已切到下一章并可继续
       onState: () => {},
       onError: () => {},
+      onSlowNet: () => {},              // 网速持续低于音频码率时提示换离线音色
     };
 
     if (this.native) {
@@ -84,7 +85,11 @@ export class Speaker {
         this.emit();
         this.hooks.onError('定时关闭时间已到，朗读已停止');
       };
-      window.__ttsEvent = (type, id) => this.onNativeEvent(type, id);
+      window.__ttsEvent = (type, id) => {
+        // slownet 是原生侧的带宽告警，与单句播放状态无关，不受下面的 token 校验约束
+        if (type === 'slownet') { this.hooks.onSlowNet(); return; }
+        this.onNativeEvent(type, id);
+      };
 
       // 回到前台：后台期间进度回调可能被丢弃，这里与原生对齐一次
       document.addEventListener('visibilitychange', () => {
