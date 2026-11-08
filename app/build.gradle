@@ -10,8 +10,8 @@ android {
         applicationId "com.qingyue.reader"
         minSdk 26
         targetSdk 34
-        versionCode 39
-        versionName "1.36.0"
+        versionCode 40
+        versionName "1.37.0"
         // 离线 native 语音引擎（sherpa-onnx）已从 App 移除：它在部分机型上加载即崩溃，
         // 且需要 78MB 模型包。现在只有在线音色 + 系统语音两条路，均不含 native 库。
     }

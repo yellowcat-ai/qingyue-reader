@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.36';
-import { settings, saveSettings } from './settings.js?v=1.36';
-import { splitSentences } from './parser.js?v=1.36';
-import { Speaker } from './tts.js?v=1.36';
+import { db, newId } from './db.js?v=1.37';
+import { settings, saveSettings } from './settings.js?v=1.37';
+import { splitSentences } from './parser.js?v=1.37';
+import { Speaker } from './tts.js?v=1.37';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

@@ -433,9 +433,18 @@ public class MainActivity extends ComponentActivity {
 
             @Override
             public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
-                // 渲染进程崩溃（常见于解析超大文件时内存不足）：不让整个 APP 闪退，直接重建页面
-                CrashLogger.logText(MainActivity.this, "renderer gone",
-                        "didCrash=" + (detail != null && detail.didCrash()));
+                // WebView 渲染进程终止，两种情况必须区分对待：
+                //  didCrash=true  —— 渲染进程自身崩溃，多为一次性解析超大 TXT / 整章 DOM 过大撑爆内存
+                //  didCrash=false —— 进程被系统回收（内存压力下 LMK 清理后台），ColorOS 等系统上属常态，
+                //                    与 App 代码无关
+                // 旧版把两者都写进 crash.log，导致用户下次启动看到「上次运行出现异常」而误以为 App 崩溃，
+                // 实际数据无损、页面已自动恢复。现改为：仅真崩溃落盘，被回收只记 Info。
+                final boolean crashed = detail != null && detail.didCrash();
+                if (crashed) {
+                    CrashLogger.logText(MainActivity.this, "renderer crashed", "didCrash=true");
+                } else {
+                    Log.i(TAG, "renderer reclaimed by system (not a crash), reload page silently");
+                }
                 try {
                     if (webView != null) {
                         android.view.ViewGroup parent = (android.view.ViewGroup) webView.getParent();
@@ -475,11 +484,11 @@ public class MainActivity extends ComponentActivity {
         webView.addJavascriptInterface(nativeTTS, "AndroidTTS");
         webView.addJavascriptInterface(fileBridge, "AndroidFile");
 
-        if (savedInstanceState == null) {
-            webView.loadUrl(APP_URL);
-        } else {
-            webView.restoreState(savedInstanceState);
-        }
+        // 一律重新加载入口页。
+        // 不用 restoreState 的原因：渲染进程被系统回收后，保存的 WebView 状态对应的进程已不存在，
+        // restoreState 会返回空、页面停在白屏。书库、阅读进度、朗读位置都持久化在 IndexedDB 里，
+        // 重载页面后由 JS 自动恢复到原位，效果等同「恢复现场」且稳定。
+        webView.loadUrl(APP_URL);
 
         // 听书前台服务需要通知权限（Android 13+）：不授权也能播，但锁屏后没有常驻通知可停止
         if (Build.VERSION.SDK_INT >= 33) {
@@ -495,7 +504,8 @@ public class MainActivity extends ComponentActivity {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        if (webView != null) webView.saveState(outState);
+        // 有意不保存 WebView 状态：渲染进程被回收后 restoreState 拿不回页面（白屏），
+        // 重建时统一走 loadUrl(APP_URL)，由 IndexedDB 恢复书库与进度。
     }
 
     @SuppressLint("MissingSuperCall")

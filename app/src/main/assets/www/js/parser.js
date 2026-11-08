@@ -186,7 +186,46 @@ export async function splitChapters(raw, opts = {}) {
     push();
   }
 
-  return chapters.map(c => ({ title: c.title.slice(0, 80), text: c.text }));
+  return capChapterSize(chapters, opts);
+}
+
+/**
+ * 单章体积上限保护。
+ *
+ * 阅读页是把整章文本一次性写进 innerHTML 的，章节越大渲染进程的 DOM/排版内存越高。
+ * TXT 里如果章节标记稀疏（只有「第X卷」、或全书只有两三个「第X章」），单章可能几十万字，
+ * 一次渲染就会把 WebView 渲染进程顶到系统内存上限，表现为进程被回收（页面闪回首页/白屏）。
+ * 这里把超长章节按段落再切成若干节，保证任何一节的渲染开销都在安全范围内。
+ *
+ * 阈值取 1.6 倍：略超上限的正常章节不去动它，避免无谓地打散篇章结构。
+ */
+function capChapterSize(chapters, opts = {}) {
+  const MAX = opts.maxChapterChars || 6000;
+  const LIMIT = Math.round(MAX * 1.6);
+  const out = [];
+  for (const c of chapters) {
+    const text = c.text || '';
+    if (text.length <= LIMIT) { out.push(c); continue; }
+    const paras = text.split('\n');
+    let buf = [], len = 0, part = 0;
+    const flush = () => {
+      if (!buf.length) return;
+      part++;
+      const title = part === 1
+        ? c.title
+        : c.title.replace(/[（(]\d+[）)]$/, '').slice(0, 60) + '（' + part + '）';
+      out.push({ title, text: buf.join('\n') });
+      buf = []; len = 0;
+    };
+    for (const p of paras) {
+      // 单段本身超长时不再累加，先落盘已有内容，避免一节远大于 MAX
+      if (len && len + p.length > MAX) flush();
+      buf.push(p);
+      len += p.length + 1;
+    }
+    flush();
+  }
+  return out.map(c => ({ title: String(c.title || '').slice(0, 80), text: c.text }));
 }
 
 /* ---------------- TXT ---------------- */
