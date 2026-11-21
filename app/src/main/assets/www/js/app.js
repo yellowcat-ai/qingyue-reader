@@ -2,11 +2,12 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js?v=1.37';
-import { settings, saveSettings } from './settings.js?v=1.37';
-import { parseFile } from './parser.js?v=1.37';
-import { reader } from './reader.js?v=1.37';
-import { ttsSupported, isNativeApp } from './tts.js?v=1.37';
+import { db, newId, storageInfo } from './db.js?v=1.41';
+import { settings, saveSettings } from './settings.js?v=1.41';
+import { parseFile } from './parser.js?v=1.41';
+import { reader } from './reader.js?v=1.41';
+import { pdfview } from './pdfview.js?v=1.45';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.41';
 
 const $ = id => document.getElementById(id);
 const GRADS = [
@@ -27,6 +28,16 @@ const app = {
     reader.init();
     reader.onToast = m => this.toast(m);
     reader.onTtsState = s => this.onTtsState(s);
+
+    pdfview.init();
+    pdfview.onToast = m => this.toast(m);
+    pdfview.onExit = () => {
+      if (location.hash) location.hash = '';
+      this.showPage('library');
+      this.refreshShelf();
+    };
+    pdfview.onSwitch = mode => this.switchReadMode(mode);
+    this.bindBookMode();
 
     this.bindNav();
     this.bindImport();
@@ -192,7 +203,8 @@ const app = {
     if (m) {
       const b = this.books.find(x => x.id === m[1]);
       // 已经在这本书的阅读页里（openBook 自己改 hash 会再触发一次 route），不要重开
-      if (b && this.curBookId === b.id && $('page-reader').classList.contains('active')) return;
+      if (b && this.curBookId === b.id &&
+          ($('page-reader').classList.contains('active') || $('page-pv').classList.contains('active'))) return;
       if (b) this.openBook(b);
       else { location.hash = ''; this.showPage('library'); }
     } else {
@@ -205,8 +217,10 @@ const app = {
     if (name !== 'reader' && $('page-reader').classList.contains('active') && reader.book) {
       reader.saveProgress();
     }
+    if (name !== 'pv' && $('page-pv').classList.contains('active')) pdfview.saveProgress();
     $('page-library').classList.toggle('active', name === 'library');
     $('page-reader').classList.toggle('active', name === 'reader');
+    $('page-pv').classList.toggle('active', name === 'pv');
   },
 
   /* ================= 书架 ================= */
@@ -301,8 +315,9 @@ const app = {
           const mb = it.size ? (it.size / 1048576).toFixed(1) : '?';
           text.textContent = `正在读取 ${name}（${mb} MB，${i + 1}/${list.length}）`;
           mask.classList.add('show');
-          if (it.size > 60 * 1048576) {
-            this.toast(`${name} 超过 60 MB，导入可能因内存不足失败`);
+          const bigLimit = /\.pdf$/i.test(name) ? 100 : 60;
+          if (it.size > bigLimit * 1048576) {
+            this.toast(`${name} 超过 ${bigLimit} MB，导入可能因内存不足失败`);
           }
           const buf = await this.fetchNativeFile(it);
           if (!buf || !buf.byteLength) { this.toast(`${name} 读取失败`); continue; }
@@ -326,11 +341,13 @@ const app = {
     return await res.arrayBuffer();
   },
 
-  /** 系统选择器给出的文件名可能缺后缀，补一个以便正确识别 EPUB */
+  /** 系统选择器给出的文件名可能缺后缀，补一个以便正确识别 EPUB / PDF */
   pickName(name, mime) {
     let n = (name || '').trim() || '未命名.txt';
     if (!/\.[a-z0-9]+$/i.test(n)) {
-      n += (mime && /epub|zip/i.test(mime)) ? '.epub' : '.txt';
+      if (mime && /pdf/i.test(mime)) n += '.pdf';
+      else if (mime && /epub|zip/i.test(mime)) n += '.epub';
+      else n += '.txt';
     }
     return n;
   },
@@ -339,12 +356,17 @@ const app = {
     const mask = $('loading-mask'), text = $('loading-text');
     mask.classList.add('show');
     let ok = 0;
+    const warns = [];
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       text.textContent = `正在解析 ${f.name}（${i + 1}/${files.length}）`;
       await sleep(30);
       try {
         const parsed = await parseFile(f, { onProgress: p => { text.textContent = `正在解析 ${f.name} ${p}%`; } });
+        // 结构体检的结论（竖排/多栏）不阻止导入，但必须让用户知道排版可能乱
+        if (parsed.warnings && parsed.warnings.length) {
+          warns.push(`${parsed.title}：${parsed.warnings.join('；')}`);
+        }
         const book = await reader.saveBook(parsed, f, { color: (this.books.length + ok) % GRADS.length });
         this.books.push(book);
         ok++;
@@ -354,16 +376,113 @@ const app = {
       }
     }
     mask.classList.remove('show');
-    if (ok) { await this.refreshShelf(); this.toast(`成功导入 ${ok} 本`); }
+    if (ok) {
+      await this.refreshShelf();
+      if (warns.length) this.toast(`成功导入 ${ok} 本，但注意：${warns.join('；')}`, 6000);
+      else this.toast(`成功导入 ${ok} 本`);
+    }
   },
 
   /* ================= 阅读 ================= */
   openBook(book) {
     this.curBookId = book.id;
+    if (location.hash !== '#/read/' + book.id) location.hash = '#/read/' + book.id;
+    // 结构体检判定这本书不该重排（扫描件/竖排/多栏）：按页原样显示
+    if (book.format === 'pdf' && book.readMode === 'page') {
+      this.showPage('pv');
+      pdfview.open(book).then(ok => { if (ok) pdfview.chrome(false); });
+      return;
+    }
     const r = reader.open(book);
     this.showPage('reader');
-    if (location.hash !== '#/read/' + book.id) location.hash = '#/read/' + book.id;
     r.then(ok => { if (ok) reader.toggleChrome(false); });
+  },
+
+  /**
+   * 切换阅读方式（PDF 专用）。
+   * progress.chapterIndex 在两种读法下含义不同——按页时是页序号，重排时是章序号，
+   * 直接沿用会让「读到第 90 页」变成「跳到第 90 章」。因此一律按全书百分比重新定位。
+   */
+  async switchReadMode(mode) {
+    const cur = pdfview.book || this.books.find(x => x.id === this.curBookId);
+    if (!cur || cur.readMode === mode) return;
+    if (mode === 'text' && !cur.chapterCount) { this.toast('这本书没有可重排的文字，只能原样阅读'); return; }
+
+    if (cur.readMode === 'page') await pdfview.saveProgress();   // 先把页位置落库
+    const nb = await this.applyReadMode(cur.id, mode);
+    if (!nb) { this.toast('切换失败：书不见了'); return; }
+
+    pdfview.unmount();
+    this.curBookId = null;          // 让 openBook 照常重开（同书也不走「已在这一页」的短路）
+    this.openBook(nb);
+    this.toast(mode === 'page' ? '已切换为原样阅读（按页显示）' : '已切换为重排阅读');
+  },
+
+  /** 改 readMode 并按百分比换算进度；返回更新后的书 */
+  async applyReadMode(id, mode) {
+    const b = await db.getBook(id);
+    if (!b) return null;
+    if (b.readMode !== mode) {
+      if (!b.readMode) {
+        // v1.44 之前导入的书没有 readMode 字段：只是补记字段，进度本就是重排坐标系，不能重算
+        await db.patchBook(id, { readMode: mode });
+      } else {
+        const pct = Math.min(100, Math.max(0, (b.progress && b.progress.percent) || 0));
+        const progress = await this.mapProgress(b, mode, pct);
+        await db.patchBook(id, { readMode: mode, progress, lastReadAt: Date.now() });
+        // 旧读法的本地备份与原生朗读位置属于另一套坐标系，留着会被当成「更新的进度」顶回去
+        reader.clearPos(id);
+      }
+    }
+    const nb = await db.getBook(id);
+    if (nb) this.books = this.books.map(x => (x.id === nb.id ? nb : x));
+    return nb;
+  },
+
+  /** 全书百分比 → 目标读法下的位置 */
+  async mapProgress(book, mode, pct) {
+    if (mode === 'page') {
+      const n = Math.max(1, book.pageCount || 1);
+      return { chapterIndex: Math.round(pct / 100 * (n - 1)), blockIndex: 0, ratio: 0, percent: pct };
+    }
+    // 按累计字数定位章节：各章长度差别很大，按章数均分会明显偏
+    let titles = [];
+    try { titles = await db.getTitles(book.id); } catch (e) { titles = []; }
+    const total = titles.reduce((a, t) => a + (t.len || 0), 0);
+    if (!total) {
+      const n = Math.max(1, titles.length || book.chapterCount || 1);
+      return { chapterIndex: Math.round(pct / 100 * (n - 1)), blockIndex: 0, ratio: 0, percent: pct };
+    }
+    const target = total * pct / 100;
+    let acc = 0, ci = 0;
+    for (let i = 0; i < titles.length; i++) {
+      acc += titles[i].len || 0;
+      ci = i;
+      if (acc >= target) break;
+    }
+    return { chapterIndex: ci, blockIndex: 0, ratio: 0, percent: pct };
+  },
+
+  /** 书籍详情里的「阅读方式」分段按钮 */
+  bindBookMode() {
+    const seg = $('bk-mode');
+    if (!seg) return;
+    seg.addEventListener('click', async e => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      const b = this._sheetBook;
+      const mode = btn.dataset.v;
+      if (!b || b.readMode === mode) { this.closeSheets(); return; }
+      if (mode === 'text' && !b.chapterCount) {
+        this.toast('这本书没有可重排的文字，只能原样阅读');
+        return;
+      }
+      this.closeSheets();
+      const nb = await this.applyReadMode(b.id, mode);
+      if (!nb) return;
+      await this.refreshShelf();
+      this.openBook(nb);
+    });
   },
 
   bindReader() {
@@ -733,13 +852,18 @@ const app = {
   /* ================= 书籍详情 ================= */
   openBookSheet(book) {
     this.curBookId = book.id;
+    this._sheetBook = book;
     $('bk-title').textContent = book.title;
     const p = book.progress || {};
+    // 按页阅读的书没有章节与字数（扫描件连文字都没有），显示页码才不显得像坏数据
+    const byPage = book.readMode === 'page' && book.pageCount;
     const rows = [
       ['作者', book.author || '—'],
       ['格式', (book.format || '').toUpperCase() + (book.encoding ? ' · ' + book.encoding : '')],
-      ['章节', book.chapterCount + ' 章'],
-      ['字数', fmtChars(book.chars)],
+      ...(byPage
+        ? [['页数', book.pageCount + ' 页'], ['读法', '原样按页（不重排）'],
+           ['章节', book.chapterCount ? book.chapterCount + ' 章（可重排）' : '无文字层']]
+        : [['章节', book.chapterCount + ' 章'], ['字数', fmtChars(book.chars)]]),
       ['大小', fmtSize(book.size)],
       ['导入时间', fmtDate(book.createdAt)],
       ['上次阅读', (p.chapterIndex !== undefined ? `第 ${p.chapterIndex + 1} 章 · ` : '') + (p.percent ? p.percent.toFixed(1) + '%' : '未读')],
@@ -747,6 +871,19 @@ const app = {
     $('bk-info').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`).join('');
     $('bk-encode-group').style.display = book.format === 'txt' ? '' : 'none';
     $('bk-encode').value = 'auto';
+
+    // 阅读方式开关：只有 PDF 有两种读法（按页原样 / 抽文字重排）
+    const mg = $('bk-mode-group');
+    const canText = book.format === 'pdf' && !!book.chapterCount;
+    const canPage = book.format === 'pdf';
+    mg.style.display = (canText && canPage) ? '' : 'none';
+    if (canText && canPage) {
+      const cur = book.readMode === 'page' ? 'page' : 'text';
+      document.querySelectorAll('#bk-mode button').forEach(b => b.classList.toggle('on', b.dataset.v === cur));
+      $('bk-mode-tip').textContent = cur === 'page'
+        ? '当前按页原样显示：版式不会乱，但不能改字号与主题'
+        : '当前为文字重排：可改字号与主题，个别版式可能分段偏粗';
+    }
     this.openSheet('sheet-book');
   },
 
@@ -825,12 +962,12 @@ const app = {
     document.querySelectorAll('.sheet').forEach(s => s.classList.remove('open'));
   },
 
-  toast(msg) {
+  toast(msg, ms = 2000) {
     const t = $('toast');
     t.textContent = msg;
     t.classList.add('show');
     clearTimeout(this._t);
-    this._t = setTimeout(() => t.classList.remove('show'), 2000);
+    this._t = setTimeout(() => t.classList.remove('show'), ms);
   },
 
   async copyText(s) {

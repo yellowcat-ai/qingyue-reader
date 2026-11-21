@@ -12,7 +12,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/app.css?v=1.37">
+<link rel="stylesheet" href="css/app.css?v=1.41">
 </head>
 <body>
 
@@ -58,7 +58,7 @@
         <svg class="ic"><use href="#i-plus"/></svg>
         <span>导入本地小说</span>
       </button>
-      <p class="import-tip">支持 TXT / EPUB，文件只存在你手机本地，不会上传</p>
+      <p class="import-tip">支持 TXT / EPUB / PDF，文件只存在你手机本地，不会上传</p>
     </div>
 
     <div class="lib-meta">
@@ -72,7 +72,7 @@
     <div id="empty-state" class="empty-state">
       <svg class="empty-ic"><use href="#i-book"/></svg>
       <p class="empty-t">书架空空如也</p>
-      <p class="empty-d">点击上方按钮导入 TXT 或 EPUB 小说<br>阅读进度与听书设置会自动保存</p>
+      <p class="empty-d">点击上方按钮导入 TXT / EPUB / PDF<br>阅读进度与听书设置会自动保存</p>
     </div>
   </div>
 </section>
@@ -114,6 +114,43 @@
 
   <div class="toast-lite" id="rd-toast"></div>
 </section>
+
+<!-- ============ 原样阅读页（PDF 按页渲染，不重排） ============ -->
+<section id="page-pv" class="page">
+  <header class="pv-top" id="pv-top">
+    <button class="icon-btn" id="pv-back" title="返回书架"><svg><use href="#i-back"/></svg></button>
+    <div class="rd-title-wrap">
+      <div class="rd-book" id="pv-book-name">—</div>
+      <div class="rd-chap" id="pv-page-name">—</div>
+    </div>
+    <button class="pv-zoom-btn" id="pv-zoom" title="缩放">1×</button>
+  </header>
+
+  <div class="pv-scroll" id="pv-scroll"><div class="pv-pages" id="pv-pages"></div></div>
+
+  <footer class="pv-bottom" id="pv-bottom">
+    <button class="pv-tool" id="pv-toc"><svg><use href="#i-list"/></svg><span>目录</span></button>
+    <div class="pv-nav">
+      <div class="pv-count"><span id="pv-idx">1</span><i>/</i><span id="pv-total">0</span></div>
+      <input type="range" id="pv-range" min="1" max="1" value="1" aria-label="翻页">
+    </div>
+    <button class="pv-tool" id="pv-mode"><svg><use href="#i-sliders"/></svg><span>重排</span></button>
+  </footer>
+
+  <div class="toast-lite" id="pv-toast"></div>
+</section>
+
+<!-- ============ PDF 目录面板 ============ -->
+<div class="sheet" id="sheet-pvtoc">
+  <div class="sheet-mask" data-close></div>
+  <div class="sheet-panel sheet-right">
+    <div class="sheet-head">
+      <h3>目录</h3>
+      <button class="icon-btn" id="pv-toc-close"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="catalog-list" id="pvtoc-list"></div>
+  </div>
+</div>
 
 <!-- ============ 目录面板 ============ -->
 <div class="sheet" id="sheet-catalog">
@@ -280,6 +317,13 @@
         </select>
         <div class="set-d">乱码时切换编码后重新分章</div>
       </div>
+      <div class="set-group" id="bk-mode-group" style="display:none">
+        <label class="set-label">阅读方式</label>
+        <div class="seg" id="bk-mode">
+          <button data-v="text">文字重排</button><button data-v="page">原样按页</button>
+        </div>
+        <div class="set-d" id="bk-mode-tip"></div>
+      </div>
       <div class="bk-actions">
         <button class="ghost-btn wide" id="bk-restart"><svg class="ic"><use href="#i-refresh"/></svg> 从头开始阅读</button>
         <button class="ghost-btn wide" id="bk-reparse"><svg class="ic"><use href="#i-refresh"/></svg> 重新分章</button>
@@ -316,9 +360,10 @@
 <div class="loading-mask" id="loading-mask"><div class="spinner"></div><div class="loading-text" id="loading-text">解析中…</div></div>
 <div class="toast" id="toast"></div>
 
-<input type="file" id="file-input" accept=".txt,.text,.epub,text/plain,application/epub+zip,*/*" multiple style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0">
+<input type="file" id="file-input" accept=".txt,.text,.epub,.pdf,text/plain,application/epub+zip,application/pdf,*/*" multiple style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0">
 
 <script src="vendor/jszip.min.js"></script>
-<script type="module" src="js/app.js?v=1.37"></script>
+<script src="vendor/pdfjs/pdf.min.js"></script>
+<script type="module" src="js/app.js?v=1.45"></script>
 </body>
 </html>

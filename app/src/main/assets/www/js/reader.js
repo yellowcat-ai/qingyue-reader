@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.37';
-import { settings, saveSettings } from './settings.js?v=1.37';
-import { splitSentences } from './parser.js?v=1.37';
-import { Speaker } from './tts.js?v=1.37';
+import { db, newId } from './db.js?v=1.41';
+import { settings, saveSettings } from './settings.js?v=1.41';
+import { splitSentences } from './parser.js?v=1.41';
+import { Speaker } from './tts.js?v=1.41';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -906,6 +906,10 @@ export const reader = {
       encoding: parsed.encoding || '',
       cover: parsed.cover || null,
       color: opts.color !== undefined ? opts.color : Math.floor(Math.random() * 6),
+      // 阅读方式由导入时的结构体检决定：正常横排单栏走重排，其余按页原样显示
+      readMode: parsed.readMode || 'text',
+      pageCount: parsed.pageCount || 0,
+      toc: parsed.toc || null,
       chapterCount: chapters.length,
       chars,
       size: file ? file.size : 0,
@@ -924,13 +928,16 @@ export const reader = {
     const raw = await db.getRaw(bookId);
     if (!raw || !raw.file) throw new Error('原始文件已不存在，请重新导入');
     const { parseFile } = await import('./parser.js');
-    const parsed = await parseFile(raw.file, { encoding });
+    const parsed = await parseFile(raw.file, { encoding, cover: false });
     const chars = parsed.chapters.reduce((a, c) => a + c.text.length, 0);
     await db.putChapters(bookId, parsed.chapters);
     await db.patchBook(bookId, {
       chapterCount: parsed.chapters.length,
       chars,
       encoding: parsed.encoding || encoding,
+      readMode: parsed.readMode || 'text',
+      pageCount: parsed.pageCount || 0,
+      toc: parsed.toc || null,
       progress: { chapterIndex: 0, blockIndex: 0, ratio: 0, percent: 0 },
     });
     this.clearPos(bookId);
