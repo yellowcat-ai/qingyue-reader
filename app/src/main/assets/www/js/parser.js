@@ -52,7 +52,6 @@ export function resolvePath(base, rel) {
 }
 
 /* ---------------- 编码检测 ---------------- */
-
 export function decodeText(buf, forced) {
   const u8 = new Uint8Array(buf);
   if (forced && forced !== 'auto' && forced !== 'detect') {
@@ -83,7 +82,9 @@ export function decodeText(buf, forced) {
 export function cleanLine(line, chapterLike) {
   let s = String(line).replace(/\u3000/g, ' ').replace(/\s+$/g, '').replace(/^\s+/g, '');
   if (!s) return '';
-  if (!chapterLike) {
+  // 广告 / 水印过滤只对短行生效：盗版站的尾巴都很短，
+  // 而正文长段里出现一个链接（论文、技术书）不该整段被删
+  if (!chapterLike && s.length <= 120) {
     if (RE_AD.test(s)) return '';
     if (RE_AD2.test(s)) return '';
     if (/^[-=—*·•]{3,}$/.test(s)) return '';
@@ -208,7 +209,7 @@ export async function parseTxt(file, opts = {}) {
 }
 
 export function guessTitleFromName(name) {
-  let t = String(name || '').replace(/\.(txt|text|epub|pdf)$/i, '');
+  let t = String(name || '').replace(/\.(txt|text|epub|pdf|mobi|azw3?|prc)$/i, '');
   // 括号里的「精校版/全本/TXT」是噪声要删，但「（一）」「（上）」是卷次，删了书名就残了
   const KEEP_PAREN = /^[（(【\[]\s*(?:[上中下]|[一二三四五六七八九十]{1,3}|\d{1,2})(?:卷|册|部|集)?\s*[）)】\]]$/;
   t = t.replace(/[（(【\[][^）)】\]]{0,30}[）)】\]]/g, m => (KEEP_PAREN.test(m) ? m : ''))   // 去括号后缀
@@ -222,7 +223,7 @@ export function guessTitleFromName(name) {
 /** 从「书名-作者」型文件名里拆出作者（仅 2–3 字中文名，且书名不少于 2 字）
  *  只在元数据没有作者时兜底：三联版《倚天屠龙记(一)-金庸.pdf》实测书名会带上「-金庸」 */
 export function guessAuthorFromName(name) {
-  const t = String(name || '').replace(/\.(txt|text|epub|pdf)$/i, '').trim();
+  const t = String(name || '').replace(/\.(txt|text|epub|pdf|mobi|azw3?|prc)$/i, '').trim();
   const m = /^(.{2,}?)[\s_—–\-]+([\u4e00-\u9fa5]{2,3})$/.exec(t);
   return m ? m[2] : '';
 }
@@ -238,8 +239,26 @@ function findFile(zip, path) {
   return null;
 }
 
+/** 块级标签：决定「一段」的边界。HTML/EPUB/MOBI 共用同一套抽取规则 */
+const HTML_BLOCK = new Set([
+  'P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'PRE',
+  'TD', 'TH', 'TR', 'TABLE', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'FIGURE',
+  'FIGCAPTION', 'DD', 'DT', 'DL', 'MAIN', 'ADDRESS', 'CENTER', 'FORM', 'HR', 'BODY',
+]);
+const HTML_BLOCK_SEL = Array.from(HTML_BLOCK).map(t => t.toLowerCase()).join(',');
+
 function htmlToText(html, dropTitle) {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
+  let src = String(html || '');
+  // 老 MOBI 可能把整本书按记录切成多个完整 HTML 文档再拼接：浏览器只认第一份，
+  // 后面的正文全落到 </html> 之后被丢掉 —— 检出这种「文档边界后面还有正文」时先拆平
+  const closes = src.match(/<\/html>/gi) || [];
+  const lastClose = src.toLowerCase().lastIndexOf('</html>');
+  const trailing = lastClose >= 0 ? src.slice(lastClose + 7).trim() : '';
+  if (closes.length > 1 || trailing.length > 40) {
+    src = src.replace(/<head\b[\s\S]*?<\/head>/gi, ' ')
+             .replace(/<\/?(?:html|head|body)\b[^>]*>/gi, ' ');
+  }
+  const doc = new DOMParser().parseFromString(src, 'text/html');
   doc.querySelectorAll('script,style,nav,head,sup,rt,rp,iframe,svg').forEach(n => n.remove());
   if (dropTitle) {
     doc.querySelectorAll('h1,h2,h3,h4').forEach(n => {
@@ -250,15 +269,32 @@ function htmlToText(html, dropTitle) {
   const root = doc.body || doc.documentElement;
   if (!root) return '';
 
-  let nodes = Array.from(root.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,blockquote,pre,td'));
-  if (!nodes.length) nodes = Array.from(root.querySelectorAll('div'));
-  if (!nodes.length) return (root.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
-
+  // 逐块取「本块自己的文字」：文本节点 + 内联后代，但**不**含嵌套块里的文字。
+  // 每个文字节点只会归属于最近的那个块级祖先，所以既不重复计数，
+  // 也不会像「只取最内层节点」那样把外层 li / body 自己的文字丢掉。
   const out = [];
-  for (const n of nodes) {
-    const t = (n.textContent || '').replace(/[\u00a0\u3000]/g, ' ').replace(/[ \t]+/g, ' ').trim();
+  const push = (s) => {
+    const t = String(s)
+      .replace(/[\u00a0\u3000]/g, ' ')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{2,}/g, '\n')
+      .trim();
     if (t) out.push(t);
-  }
+  };
+  const ownText = (node) => {
+    let s = '';
+    for (const c of node.childNodes) {
+      if (c.nodeType === 3) s += c.nodeValue;
+      else if (c.nodeType === 1 && !HTML_BLOCK.has(c.tagName)) s += ownText(c);
+    }
+    return s;
+  };
+  const blocks = Array.from(root.querySelectorAll(HTML_BLOCK_SEL));
+  if (!blocks.length) return (root.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+  push(ownText(root));
+  for (const b of blocks) push(ownText(b));
+
+  if (!out.length) return (root.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
   return out.join('\n');
 }
 
@@ -1097,12 +1133,219 @@ export async function parsePdf(file, opts = {}) {
   }
 }
 
+/* ---------------- MOBI / AZW3 ----------------
+ * 容器是 Palm 的 PDB 数据库文件：一段头 + 一串 record，正文是 HTML
+ *   mobi7（老 Kindle 格式，.mobi/.prc）：HTML 3.2 子集，压缩 PalmDOC LZ77 或 HUFF/CDIC
+ *   AZW3（KF8）：同样的壳，正文是 HTML5 分片，靠 FDST + skeleton 索引拼回完整文档
+ * 解析交给 vendor/mobi（@lingo-reader/mobi-parser，MIT 许可，已 esbuild 打包成单文件）
+ * 本文件只负责三件事：预检（魔数 / DRM / 压缩方式）→ 抽 HTML → 复用 TXT 的净化与分章
+ * 这样 MOBI 与 TXT/EPUB 的章节结果同构，进度、翻页、听书不必特殊处理
+ */
+
+const RE_MOBI = /\.(mobi|azw3?|prc)$/i;
+
+/** 读 PDB 头，只取判断所需字段；顺带把「加密」「未知压缩」挡在外面 */
+function mobiPrecheck(u8) {
+  if (!u8 || u8.length < 128) throw new Error('文件过小，不是有效的 MOBI / AZW3 文件');
+  let sig = '';
+  for (let i = 60; i < 68; i++) sig += String.fromCharCode(u8[i]);
+  if (sig !== 'BOOKMOBI' && sig !== 'TEXtREAd') {
+    throw new Error('不是有效的 MOBI / AZW3 文件（缺少 BOOKMOBI 标识）');
+  }
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const rec0 = dv.getUint32(78);
+  if (rec0 + 32 > u8.length) throw new Error('MOBI 文件头损坏');
+  const compression = dv.getUint16(rec0);
+  const encryption = dv.getUint16(rec0 + 12);
+  let version = 0, encoding = 0;
+  if (String.fromCharCode(u8[rec0 + 16], u8[rec0 + 17], u8[rec0 + 18], u8[rec0 + 19]) === 'MOBI') {
+    encoding = dv.getUint32(rec0 + 28);
+    version = dv.getUint32(rec0 + 36);
+  }
+  if (encryption !== 0) {
+    throw new Error('这本书带 DRM 加密，无法导入。亚马逊购买的书通常如此，需先用 Calibre 去掉保护后再导入');
+  }
+  if (compression !== 1 && compression !== 2 && compression !== 17480) {
+    throw new Error('暂不支持这种 MOBI 压缩方式（' + compression + '）');
+  }
+  return { compression, encryption, version, encoding };
+}
+
+/** 隐字符清理：软连字符会把「Epictetus」显示成断字，TTS 也会念错 */
+function tidyText(t) {
+  return String(t || '')
+    .replace(/[\u00ad\u200b\u200c\u200d\ufeff]/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** mobi7 没有可靠的分章结构，直接把全部文本记录拼成一份 HTML，交给 splitChapters 按「第 N 章」切 */
+function mobiRawHtml(book) {
+  const mf = book && book.mobiFile;
+  const n = mf && mf.palmdocHeader && mf.palmdocHeader.numTextRecords;
+  if (!n || typeof mf.loadTextBuffer !== 'function' || typeof mf.decode !== 'function') return '';
+  const parts = [];
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    try {
+      const b = mf.loadTextBuffer(i);
+      if (b && b.length) { parts.push(b); total += b.length; }
+    } catch (e) { /* 单条记录坏了不影响其它记录 */ }
+  }
+  if (!total) return '';
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { all.set(p, off); off += p.length; }
+  try { return mf.decode(all.buffer); } catch (e) { return ''; }
+}
+
+/** AZW3：spine 就是文档顺序，章节名从目录索引反查
+ *  同一个文档常被目录里的多个锚点指向（章 → 节），只取第一个，否则标题会被最后一个节名覆盖 */
+async function kf8Chapters(book, onProgress) {
+  const labelById = new Map();
+  const walk = (items) => {
+    for (const it of items || []) {
+      try {
+        const r = book.resolveHref(it.href);
+        if (r && r.id != null) {
+          const key = String(r.id);
+          if (!labelById.has(key)) labelById.set(key, String(it.label || '').trim());
+        }
+      } catch (e) { /* 单个目录项解析失败忽略 */ }
+      if (it.children) walk(it.children);
+    }
+  };
+  try { walk(book.getToc()); } catch (e) { /* 无目录时靠正文标题兜底 */ }
+
+  const spine = book.getSpine() || [];
+  const out = [];
+  for (let i = 0; i < spine.length; i++) {
+    const it = spine[i];
+    let html = '';
+    try {
+      const ch = await book.loadChapter(it.id);
+      html = (ch && ch.html) || '';
+    } catch (e) { html = ''; }
+    const label = labelById.get(String(it.id)) || '';
+    const text = tidyText(htmlToText(html, label));
+    if (!text) continue;
+    const t = (label || pickInnerTitle(html) || ('第 ' + (out.length + 1) + ' 章')).slice(0, 80);
+    if (out.length && text.length < 40) out[out.length - 1].text += '\n' + text;   // 过短片段并入上一章
+    else out.push({ title: t, text });
+    if (i % 8 === 0) {
+      onProgress(30 + Math.round(i / Math.max(spine.length, 1) * 60));
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+  return out;
+}
+
+/** 封面：库里给的是 blob URL（浏览器端），转成 Blob 与 EPUB 的存储方式保持一致 */
+async function mobiCover(book) {
+  try {
+    const url = typeof book.getCoverImage === 'function' ? book.getCoverImage() : '';
+    if (!url || typeof url !== 'string') return null;
+    const blob = await (await fetch(url)).blob();
+    if (/^blob:/.test(url)) URL.revokeObjectURL(url);
+    return blob && blob.size ? blob : null;
+  } catch (e) { return null; }
+}
+
+export async function parseMobi(file, opts = {}) {
+  const onProgress = opts.onProgress || (() => {});
+  const u8 = new Uint8Array(await file.arrayBuffer());
+  const info = mobiPrecheck(u8);
+  onProgress(6);
+
+  let lib;
+  try { lib = await import('../vendor/mobi/mobi-parser.js'); }
+  catch (e) { throw new Error('MOBI 解析组件未加载，请重启应用后再试'); }
+
+  // 文件版本 >= 8 是 KF8；两种都试一遍，谁先成功用谁（组合型 .mobi 两段并存）
+  const order = info.version >= 8 ? ['kf8', 'mobi'] : ['mobi', 'kf8'];
+  let book = null, kind = 'mobi', lastErr = null;
+  for (const k of order) {
+    try {
+      book = k === 'kf8' ? await lib.initKf8File(u8.slice()) : await lib.initMobiFile(u8.slice());
+      kind = k;
+      if (book) break;
+    } catch (e) { lastErr = e; book = null; }
+  }
+  if (!book) throw new Error('MOBI 解析失败：' + ((lastErr && lastErr.message) || '文件结构异常'));
+  onProgress(30);
+
+  const md = book.getMetadata() || {};
+  const title = String(md.title || '').trim() || guessTitleFromName(file.name);
+  let author = md.author;
+  if (Array.isArray(author)) author = author.filter(Boolean).join('、');
+  author = String(author || '').trim() || guessAuthorFromName(file.name);
+
+  let chapters = [];
+  if (kind === 'kf8') {
+    chapters = await kf8Chapters(book, onProgress);
+  } else {
+    const rawHtml = mobiRawHtml(book);
+    const rawText = rawHtml ? tidyText(htmlToText(rawHtml, '')) : '';
+    // 库的 mobi7 切分按 <mbp:pagebreak> 走，多数书可信、也有整本只有一段的情况
+    // 判据：切出 ≥2 章且字数不少于全文 60% 才采用，否则退回「整本拼文本 + 正则分章」
+    let spineCh = [];
+    try {
+      for (const it of (book.getSpine() || [])) {
+        let html2 = '';
+        try { html2 = ((await book.loadChapter(it.id)) || {}).html || ''; } catch (e) { html2 = ''; }
+        const text = tidyText(htmlToText(html2, ''));
+        if (text) spineCh.push({ title: pickInnerTitle(html2) || ('第 ' + (spineCh.length + 1) + ' 章'), text });
+      }
+    } catch (e) { spineCh = []; }
+    const spineChars = spineCh.reduce((a, c) => a + c.text.length, 0);
+    const spineOk = spineCh.length >= 2 && (!rawText || spineChars >= rawText.length * 0.6);
+    // 中文小说几乎都靠「第 N 章」这类标题，正则切章比 pagebreak 更贴合阅读习惯；
+    // 只有正则切不出标题（纯英文 / 无标题书，退化成「第 N 节」均分）时才用库给的 pagebreak 切分
+    let regexCh = [];
+    let regexHasTitles = false;
+    if (rawText) {
+      regexCh = await splitChapters(rawText, opts);
+      regexHasTitles = regexCh.length >= 2 && !regexCh.every(x => /^第 \d+ 节$/.test(x.title));
+    }
+    if (regexHasTitles) chapters = regexCh;
+    else if (spineOk) chapters = spineCh;
+    else chapters = regexCh.length ? regexCh : spineCh;
+  }
+
+  // 整本书只切出一章（不少 AZW3 就是单文档）时，再按「第 N 章」正则补救一次
+  if (chapters.length <= 1) {
+    const only = chapters.length ? chapters[0].text : '';
+    if (only.length > 3000) {
+      const re = await splitChapters(only, opts);
+      if (re.length > 1) chapters = re;
+    }
+  }
+  if (!chapters.length) throw new Error('未能从这本书里读出正文');
+
+  let cover = null;
+  if (opts.cover !== false) cover = await mobiCover(book);
+  try { book.destroy && book.destroy(); } catch (e) { /* 释放失败不阻塞导入 */ }
+
+  onProgress(100);
+  return {
+    title,
+    author,
+    format: kind === 'kf8' ? 'azw3' : 'mobi',
+    encoding: info.encoding === 65001 ? 'utf-8' : (info.encoding === 1252 ? 'windows-1252' : ''),
+    chapters,
+    cover,
+  };
+}
+
 /* ---------------- 统一入口 ---------------- */
 
 export async function parseFile(file, opts = {}) {
   const name = (file.name || '').toLowerCase();
   if (/\.epub$/.test(name)) return parseEpub(file, opts);
   if (/\.pdf$/.test(name)) return parsePdf(file, opts);
+  if (RE_MOBI.test(name)) return parseMobi(file, opts);
   return parseTxt(file, opts);
 }
 

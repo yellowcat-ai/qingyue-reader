@@ -215,6 +215,9 @@ public class MainActivity extends ComponentActivity {
         String t = token.toLowerCase(Locale.US);
         if (t.endsWith(".epub")) return "application/epub+zip";
         if (t.endsWith(".pdf")) return "application/pdf";
+        // mobi 家族统一按 Kindle 电子书 MIME 处理，前端按扩展名分派
+        if (t.endsWith(".mobi") || t.endsWith(".azw") || t.endsWith(".azw3") || t.endsWith(".prc"))
+            return "application/x-mobipocket-ebook";
         if (t.endsWith(".txt") || t.endsWith(".text")) return "text/plain";
         if (t.endsWith(".zip")) return "application/zip";
         return "application/octet-stream";
@@ -229,7 +232,7 @@ public class MainActivity extends ComponentActivity {
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try {
-            nativePickLauncher.launch(Intent.createChooser(intent, "选择小说文件（TXT / EPUB / PDF）"));
+            nativePickLauncher.launch(Intent.createChooser(intent, "选择小说文件（TXT / EPUB / PDF / MOBI / AZW3）"));
         } catch (ActivityNotFoundException e) {
             Intent alt = new Intent(Intent.ACTION_GET_CONTENT);
             alt.addCategory(Intent.CATEGORY_OPENABLE);
@@ -237,7 +240,7 @@ public class MainActivity extends ComponentActivity {
             alt.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
             alt.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             try {
-                nativePickLauncher.launch(Intent.createChooser(alt, "选择小说文件（TXT / EPUB / PDF）"));
+                nativePickLauncher.launch(Intent.createChooser(alt, "选择小说文件（TXT / EPUB / PDF / MOBI / AZW3）"));
             } catch (ActivityNotFoundException e2) {
                 toast("未找到可用的文件管理器");
             }
@@ -469,7 +472,7 @@ public class MainActivity extends ComponentActivity {
                     intent.addCategory(Intent.CATEGORY_OPENABLE);
                     intent.setType("*/*");
                     intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-                    filePickerLauncher.launch(Intent.createChooser(intent, "选择小说文件（TXT / EPUB / PDF）"));
+                    filePickerLauncher.launch(Intent.createChooser(intent, "选择小说文件（TXT / EPUB / PDF / MOBI / AZW3）"));
                     return true;
                 } catch (Exception e) {
                     Log.w(TAG, "showFileChooser: " + e.getMessage());

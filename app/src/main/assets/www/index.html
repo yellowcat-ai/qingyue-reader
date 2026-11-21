@@ -58,7 +58,7 @@
         <svg class="ic"><use href="#i-plus"/></svg>
         <span>导入本地小说</span>
       </button>
-      <p class="import-tip">支持 TXT / EPUB / PDF，文件只存在你手机本地，不会上传</p>
+      <p class="import-tip">支持 TXT / EPUB / PDF / MOBI / AZW3，文件只存在你手机本地，不会上传</p>
     </div>
 
     <div class="lib-meta">
@@ -72,7 +72,7 @@
     <div id="empty-state" class="empty-state">
       <svg class="empty-ic"><use href="#i-book"/></svg>
       <p class="empty-t">书架空空如也</p>
-      <p class="empty-d">点击上方按钮导入 TXT / EPUB / PDF<br>阅读进度与听书设置会自动保存</p>
+      <p class="empty-d">点击上方按钮导入 TXT / EPUB / PDF<br>MOBI / AZW3 也可直接读<br>阅读进度与听书设置会自动保存</p>
     </div>
   </div>
 </section>
@@ -360,10 +360,10 @@
 <div class="loading-mask" id="loading-mask"><div class="spinner"></div><div class="loading-text" id="loading-text">解析中…</div></div>
 <div class="toast" id="toast"></div>
 
-<input type="file" id="file-input" accept=".txt,.text,.epub,.pdf,text/plain,application/epub+zip,application/pdf,*/*" multiple style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0">
+<input type="file" id="file-input" accept=".txt,.text,.epub,.pdf,.mobi,.azw,.azw3,.prc,text/plain,application/epub+zip,application/pdf,application/x-mobipocket-ebook,*/*" multiple style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0">
 
 <script src="vendor/jszip.min.js"></script>
 <script src="vendor/pdfjs/pdf.min.js"></script>
-<script type="module" src="js/app.js?v=1.45"></script>
+<script type="module" src="js/app.js?v=1.46"></script>
 </body>
 </html>

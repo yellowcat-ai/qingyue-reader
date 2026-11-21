@@ -347,6 +347,7 @@ const app = {
     if (!/\.[a-z0-9]+$/i.test(n)) {
       if (mime && /pdf/i.test(mime)) n += '.pdf';
       else if (mime && /epub|zip/i.test(mime)) n += '.epub';
+      else if (mime && /mobipocket|mobi|kindle/i.test(mime)) n += '.mobi';
       else n += '.txt';
     }
     return n;

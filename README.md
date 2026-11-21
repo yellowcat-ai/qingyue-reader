@@ -1,9 +1,9 @@
 # 轻阅 · 安卓本地小说阅读器
 
-一个纯本地的小说阅读 App：导入 txt / epub / pdf，自动分章、记忆阅读位置，支持在线多音色听书，
+一个纯本地的小说阅读 App：导入 txt / epub / pdf / mobi / azw3，自动分章、记忆阅读位置，支持在线多音色听书，
 锁屏与切后台后可以连续朗读、自动跨章。
 
-- 安装包见 [Releases](https://github.com/wuyoucheng/qingyue-reader/releases)
+- 安装包见 [Releases](https://github.com/yellowcat-ai/qingyue-reader/releases)
 - 体积约 4.7MB（PDF 引擎 pdf.js 约 +2MB），**零 native 库**（无 `.so`），不需要安装任何第三方语音引擎
 - 全部数据留在本机（IndexedDB），不联网也能读；听书时才访问语音接口
 
@@ -11,7 +11,7 @@
 
 | 模块 | 说明 |
 |---|---|
-| 导入 | txt（自动识别 UTF-8 / GBK / Big5）、epub、pdf（文字层抽取，抽不出的自动按页原样显示），SAF 选择文件，缓存副本避免授权失效 |
+| 导入 | txt（自动识别 UTF-8 / GBK / Big5）、epub、pdf（文字层抽取，抽不出的自动按页原样显示）、mobi / azw3（Kindle 格式，见下节），SAF 选择文件，缓存副本避免授权失效 |
 | 分章 | 按「第 N 章」等常见标题正则切章，支持手动改编码后重新解析；PDF 优先用书签切章 |
 | 阅读 | 上下滚动 / 左右翻页两种模式，字号、行距、边距、主题（纸黄/夜间/护眼）可调 |
 | 记忆 | 记住每本书的章节与位置，重进直接续读；显示总进度与剩余章节 |
@@ -220,6 +220,45 @@ node test/real.mjs tangshi.pdf "唐诗三百首.pdf" tangshi               # 诗
 node test/real.mjs fx/struct-2col.pdf "双栏.pdf" t-2col              # 结构体检正样本
 ```
 
+## MOBI / AZW3 支持
+
+Kindle 的两套格式实际是同一个壳：**Palm 的 PDB 数据库文件**（一段头 + 一串 record），正文是 HTML。
+
+| 格式 | 正文模型 | 压缩 | 处理方式 |
+|---|---|---|---|
+| MOBI（mobi7，`.mobi` / `.prc`） | HTML 3.2 子集 | PalmDOC LZ77 或 HUFF/CDIC | 拆全部文本记录拼成一份 HTML，交 TXT 那条链路分章（有 `<mbp:pagebreak>` 时优先用库的切分） |
+| AZW3（KF8，`.azw3` / `.azw`） | HTML5 分片，按 FDST + skeleton 重建 | 同上 | 逐 spine 文档抽取，章节名从目录索引反查（同一文档被多个锚点指向时取第一个） |
+
+**DRM 会明确拒绝**：PDB 头 0x0C 处的 encryption 非 0 就直接报「带 DRM 加密，需先用 Calibre 去保护」，
+不会把加密字节当正文解出一堆乱码。压缩方式只认 1（无压缩）/ 2（PalmDOC）/ 17480（HUFF/CDIC）。
+
+**实测数据**（样本：Standard Ebooks 的 *Short Works* 三件套 + libmobi 测试集，真值用 KindleUnpack 转 EPUB 后取正文）
+
+| 样本 | 格式 | 字数 | 真值 | 偏差 |
+|---|---|---|---|---|
+| epictetus.azw3 | AZW3（KF8，UTF-8） | 108,630 | 109,123 | 0.5% |
+| epictetus.mobi | MOBI（PalmDOC） | 109,714 | 110,166 | 0.4% |
+| sample-unicode-huffdic.mobi | MOBI（HUFF/CDIC） | 26,643 | 27,380 | 2.7% |
+| sample-cp1252.mobi | MOBI（windows-1252） | 26,714 | 27,345 | 2.3% |
+| sample-drm-v1.mobi | 带 DRM | — | — | 按预期拒绝导入 |
+
+偏差来源都是被过滤掉的软连字符、页眉页脚式短行与目录页，无整段丢失。
+
+**解析库**：`vendor/mobi/mobi-parser.js`，由 [@lingo-reader/mobi-parser](https://github.com/hhk-png/lingo-reader)（MIT）
+用 esbuild 打成单文件 ESM（66KB，含 fflate），仅在导入 mobi 时动态 import，不影响启动。
+许可证原文见 `vendor/mobi/LICENSE`。
+
+**这一段踩到的三个坑**（都已修）
+1. HTML 转文本按「节点列表」收集时，`<li><p>…</p></li>`、`<blockquote><p>…</p></blockquote>` 这类嵌套
+   会把同一段文字数两遍 —— MOBI 实测多出 16% 字符。改成「每个块只取自己的直接文本、递归进子块」。
+2. 老 MOBI 会把整本书按记录切成多个完整 HTML 文档拼接，浏览器只认第一份，`</html>` 之后的正文全丢
+   （HUFF/CDIC 样本只剩 663 字、内容还是从第二份文档开始的）。检出「文档边界后仍有正文」时先把边界标签拆平。
+3. 广告/水印过滤对**所有**长行生效，一段 26k 字的技术书正文因为含一个链接被整段删掉。
+   改为只对 ≤120 字的短行生效（盗版站尾巴都是短行）。
+
+**限制**：KFX（亚马逊现行私有格式）不支持；带 DRM 的书不支持；固定版式的漫画类 AZW3 只能读到文字，
+图片资源不还原；mobi7 若既没有 pagebreak 也没有「第 N 章」这类标题，会按约 4000 字等分成节。
+
 ## 语音方案
 
 App 内置了微软 Edge 在线语音（WebSocket 直连，无需 API Key、无需装引擎），
@@ -271,7 +310,10 @@ app/src/main/java/com/qingyue/reader/
 novel-reader/            网页前端（源码，sync-assets.sh 同步到 assets/www）
   js/reader.js           章节渲染、位置记忆、朗读联动
   js/tts.js              朗读控制器（原生队列 / 浏览器两条路径）
-  js/parser.js           编码识别、分章、分句；PDF 文字层抽取（parsePdf / layoutPage）
+  js/parser.js           编码识别、分章、分句；PDF 文字层抽取（parsePdf / layoutPage）；MOBI/AZW3（parseMobi）
+  vendor/mobi/           MOBI/KF8 解容器与解压（MIT，打包成单文件 ESM）
   vendor/pdfjs/          pdf.js 3.11 legacy（pdf.min.js + worker + cmaps + standard_fonts）
   test/pdf-e2e.html      PDF 解析回归页（起静态服务打开即可，含三种样例）
+  test/mobi-test.html    MOBI/AZW3 抽取回归页（node test/real.mjs <文件> <文件名> <前缀> mobi-test.html）
+  test/import-mobi.mjs   MOBI/AZW3 导入端到端（文件选择 → 书架 → 阅读页）
 ```
