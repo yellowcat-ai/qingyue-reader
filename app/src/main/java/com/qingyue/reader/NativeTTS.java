@@ -56,7 +56,21 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.33";
+
+    /**
+     * 真实安装包版本，如 "1.48.1 (56)"。
+     * 以前这里是硬编码的 APP_VER = "v1.33"，升级到 1.4x 后没跟着改，
+     * 诊断信息与「关于」面板显示的版本长期是错的 —— 改为运行时读 PackageManager。
+     */
+    private String appVersion() {
+        try {
+            android.content.pm.PackageInfo pi = appContext.getPackageManager()
+                    .getPackageInfo(appContext.getPackageName(), 0);
+            return safeStr(pi.versionName) + " (" + pi.versionCode + ")";
+        } catch (Throwable t) {
+            return "unknown";
+        }
+    }
 
     /* ---------------- 朗读进度落盘 ----------------
      * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
@@ -278,12 +292,18 @@ public class NativeTTS {
         if (qPlaying) main.post(() -> notifyProgress(true));
     }
 
+    /** 「关于」面板显示的版本号，形如 1.48.1 (56) */
+    @JavascriptInterface
+    public String getAppVersion() {
+        return appVersion();
+    }
+
     /** JS 可同步拉取的完整诊断状态（解决一切时序竞争） */
     @JavascriptInterface
     public String getDiag() {
         try {
             JSONObject o = new JSONObject();
-            o.put("ver", APP_VER);
+            o.put("ver", "v" + appVersion());
             o.put("builtinReady", builtinReady);
             o.put("builtinErr", builtinErr == null ? "" : builtinErr);
             o.put("engine", builtinReady ? "内置离线语音（小燕）" : safeStr(engineName));
@@ -305,7 +325,7 @@ public class NativeTTS {
             o.put("batteryOk", isIgnoringBattery());
             return o.toString();
         } catch (Exception e) {
-            return "{\"ver\":\"" + APP_VER + "\",\"builtinReady\":false,\"builtinErr\":\"diag error\",\"engine\":\"\",\"zh\":false,\"voices\":0,\"ready\":false,\"modelInstalled\":false,\"modelProgress\":-1,\"modelMsg\":\"\"}";
+            return "{\"ver\":\"v" + appVersion() + "\",\"builtinReady\":false,\"builtinErr\":\"diag error\",\"engine\":\"\",\"zh\":false,\"voices\":0,\"ready\":false,\"modelInstalled\":false,\"modelProgress\":-1,\"modelMsg\":\"\"}";
         }
     }
 

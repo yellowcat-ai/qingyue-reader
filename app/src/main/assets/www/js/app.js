@@ -2,14 +2,14 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js?v=1.52';
-import { settings, saveSettings } from './settings.js?v=1.52';
-import { parseFile } from './parser.js?v=1.52';
-import { reader } from './reader.js?v=1.52';
-import { pdfview } from './pdfview.js?v=1.52';
-import { ttsSupported, isNativeApp } from './tts.js?v=1.52';
-import { roleLabel, MALE_POOL, FEMALE_POOL } from './roles.js?v=1.52';
-import { baseOf, pitchOf, slotOf, PITCH_STEPS } from './rolebook.js?v=1.52';
+import { db, newId, storageInfo } from './db.js?v=1.53';
+import { settings, saveSettings } from './settings.js?v=1.53';
+import { parseFile } from './parser.js?v=1.53';
+import { reader } from './reader.js?v=1.53';
+import { pdfview } from './pdfview.js?v=1.53';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.53';
+import { roleLabel, MALE_POOL, FEMALE_POOL } from './roles.js?v=1.53';
+import { baseOf, pitchOf, slotOf, PITCH_STEPS } from './rolebook.js?v=1.53';
 
 const $ = id => document.getElementById(id);
 const GRADS = [
@@ -191,14 +191,27 @@ const app = {
       if ($('page-reader').classList.contains('active')) { $('btn-back').click(); return true; }
       return false;
     };
-    const tip = document.querySelector('.about-tip');
-    if (tip) tip.remove();
-    const ttsTip = document.querySelector('.about-tip');
-    if (ttsTip) {
-      ttsTip.innerHTML = '<b>听书没声音？</b>在系统「设置 → 系统 → 语言和输入法 → 文字转语音」中确认已安装中文语音包，并在本页听书面板里选到中文音色。';
+    // 网页版的提示文案（装到桌面 / Google 语音包）在安卓里都不适用，换成原生说法。
+    // 用 :not(.about-ver) 精确挑，避免依赖「版本行必须排在最后」这种隐式顺序
+    const tips = document.querySelectorAll('.about-tip:not(.about-ver)');
+    if (tips[0]) tips[0].remove();
+    if (tips[1]) {
+      tips[1].innerHTML = '<b>听书没声音？</b>在系统「设置 → 系统 → 语言和输入法 → 文字转语音」中确认已安装中文语音包，并在本页听书面板里选到中文音色。';
     }
     const about = document.querySelector('.about-body p');
     if (about) about.innerHTML = '<b>轻阅</b> 安卓版：所有书籍保存在手机本地，无需联网、无需登录。';
+    // 安卓独有能力：内置在线语音 + 跨章连播（网页版只有系统语音）
+    const nativeOnly = $('about-native-only');
+    if (nativeOnly) nativeOnly.hidden = false;
+    // 版本号取真实安装包信息，避免「关于」里的能力列表与版本对不上号
+    try {
+      const ver = window.AndroidTTS && window.AndroidTTS.getAppVersion ? window.AndroidTTS.getAppVersion() : '';
+      if (ver) {
+        const el = $('about-ver');
+        el.textContent = '版本 ' + ver;
+        el.hidden = false;
+      }
+    } catch (e) { /* 老版本壳没有该接口，静默跳过 */ }
   },
 
   /* ================= 路由 ================= */

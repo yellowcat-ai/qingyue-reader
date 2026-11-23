@@ -12,7 +12,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/app.css?v=1.52">
+<link rel="stylesheet" href="css/app.css?v=1.53">
 </head>
 <body>
 
@@ -352,14 +352,17 @@
     <div class="sheet-body about-body">
       <p><b>轻阅</b> 是一个纯本地的小说阅读器。所有书籍内容保存在你手机的浏览器存储中，不上传服务器、无需注册登录。</p>
       <ul class="about-list">
-        <li><svg class="ic"><use href="#i-check"/></svg> TXT / EPUB 导入，自动分章节</li>
-        <li><svg class="ic"><use href="#i-check"/></svg> 自动记录上次阅读位置，秒回现场</li>
-        <li><svg class="ic"><use href="#i-check"/></svg> 系统语音朗读，支持定时关闭</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> TXT / EPUB / PDF / MOBI / AZW3 导入，自动分章节</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> 自动记录每本书的位置与进度，重开秒回现场</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> 多角色朗读：识别对白说话人，一句一个音色，同名角色全书不换声</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> 定时关闭、语速语调调节、当前句高亮</li>
         <li><svg class="ic"><use href="#i-check"/></svg> 添加到手机桌面后离线可用</li>
+        <li id="about-native-only" hidden><svg class="ic"><use href="#i-check"/></svg> 内置在线语音（晓晓 / 云希等），不装语音包也能听；跨章连播</li>
       </ul>
       <p class="about-tip"><b>装到桌面：</b>iPhone 用 Safari 打开后点「分享 → 添加到主屏幕」；安卓 Chrome 点右上角菜单「添加到主屏幕 / 安装应用」。</p>
       <p class="about-tip"><b>听书没声音？</b>需要手机已安装中文语音引擎（安卓：设置 → 系统 → 语言和输入法 → 文字转语音，安装 Google 文字转语音的中文语音包）。</p>
       <p class="about-tip" id="about-storage"></p>
+      <p class="about-tip about-ver" id="about-ver" hidden></p>
     </div>
   </div>
 </div>
@@ -372,6 +375,6 @@
 
 <script src="vendor/jszip.min.js"></script>
 <script src="vendor/pdfjs/pdf.min.js"></script>
-<script type="module" src="js/app.js?v=1.52"></script>
+<script type="module" src="js/app.js?v=1.53"></script>
 </body>
 </html>
