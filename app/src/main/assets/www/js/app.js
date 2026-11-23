@@ -2,14 +2,14 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js?v=1.53';
-import { settings, saveSettings } from './settings.js?v=1.53';
-import { parseFile } from './parser.js?v=1.53';
-import { reader } from './reader.js?v=1.53';
-import { pdfview } from './pdfview.js?v=1.53';
-import { ttsSupported, isNativeApp } from './tts.js?v=1.53';
-import { roleLabel, MALE_POOL, FEMALE_POOL } from './roles.js?v=1.53';
-import { baseOf, pitchOf, slotOf, PITCH_STEPS } from './rolebook.js?v=1.53';
+import { db, newId, storageInfo } from './db.js?v=1.54';
+import { settings, saveSettings } from './settings.js?v=1.54';
+import { parseFile } from './parser.js?v=1.54';
+import { reader } from './reader.js?v=1.54';
+import { pdfview } from './pdfview.js?v=1.54';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.54';
+import { roleLabel, MALE_POOL, FEMALE_POOL } from './roles.js?v=1.54';
+import { baseOf, pitchOf, slotOf, PITCH_STEPS } from './rolebook.js?v=1.54';
 
 const $ = id => document.getElementById(id);
 const GRADS = [

@@ -79,6 +79,9 @@ const ACTION_TAILS = [
   // 「郭襄喜道」「那人鼓掌道」：动作/神态本身不算名字，必须先剥掉
   '鼓掌', '拍手', '拱手', '抱拳', '抚掌', '摆手', '摆手道', '接口道', '起身来',
   '跳起身来', '站起来', '抬起头来', '一声', '几声',
+  // 「”张三一愣」「”张三转身离去」：引号后名字 + 简短反应，是网文最常见的收尾
+  '一愣', '一呆', '一怔', '一叹', '一喜', '一惊', '一乐', '一凛', '一顿',
+  '转身离去', '离去', '转身离开', '离开',
   // 单字状语尾：「郭襄喜道」「卫天望怒道」「那人笑道」
   '喜', '笑', '冷', '淡', '缓', '轻', '低', '沉', '怒', '急', '柔', '厉', '微',
 ];
@@ -150,6 +153,33 @@ const WEAK_M = '公';
 
 /** 名字里出现这些词直接定性（「灭绝师太」「梅师姑」） */
 const TITLE_F = ['师太', '师姑', '道姑', '尼姑', '婆婆', '老太太'];
+
+/**
+ * 称呼前缀：「阿公墨桑」「师父李三」「大哥张五」——中文（尤其网文）常用身份称呼直接接名字。
+ * 不剥掉的话，四字串既不是双字名也不是三字名，整个说话人直接丢失：
+ * 用户实测《求魔》「”……照顾自己……” 阿公墨桑盘膝坐在那乌蟒上」整章一句都没识别出来。
+ * 只在「剥完还剩 ≥2 字」时才剥，避免把称呼本身吃掉（「师父：」）。
+ */
+const TITLE_PREFIX = ['阿公', '阿婆', '阿爷', '阿奶', '阿爹', '阿娘', '阿爸', '阿妈',
+  '公公', '婆婆', '爷爷', '奶奶', '嬷嬷', '老爹', '老娘', '老头', '老丈', '老伯',
+  '伯伯', '叔叔', '大伯', '师父', '师尊', '师伯', '师叔', '师太', '师姑', '师兄', '师姐',
+  '方丈', '道长', '长老', '族长', '大哥', '大姐', '二哥', '二姐', '三哥'];
+const TITLE_PREFIX_SORTED = [...TITLE_PREFIX].sort((a, b) => b.length - a.length);
+const TITLE_PREFIX_RE = new RegExp('(' + TITLE_PREFIX_SORTED.join('|') + ')', 'g');
+
+/** 男性称呼：判性别用。「阿公」曾被「阿X 判女」规则打成 -2，老爷子被配女声 */
+const TITLE_M = ['阿公', '阿爷', '阿爹', '阿爸', '公公', '爷爷', '老爹', '老丈', '老伯',
+  '伯伯', '叔叔', '大伯', '老头', '师父', '师尊', '师伯', '师叔', '师兄', '方丈', '道长',
+  '长老', '族长', '大哥', '二哥', '三哥', '老爷子'];
+
+/** 「阿」字昵称里的男性用字：阿公 / 阿爷 是长辈，不是「阿紫」那类女名 */
+const A_MALE = '公爷爹爸伯叔舅哥兄';
+
+/** 叙述里出现即可算男性证据的称呼（师父 / 师尊两性通用，故意不收） */
+const NARR_M_TITLE = ['阿公', '阿爷', '阿爹', '阿爸', '爷爷', '老爹', '公公', '老伯',
+  '伯伯', '叔叔', '大伯', '老头', '老头子', '老爷子', '老丈', '长老', '族长', '方丈',
+  '道长', '师兄', '师伯', '师叔', '大哥'];
+
 
 /** 台词里的自称：说话人自己报性别，最硬的证据 */
 const SELF_M = ['本公子', '本少爷', '在下', '老夫', '贫道', '贫僧', '洒家', '小生', '晚生',
@@ -280,9 +310,20 @@ function pickName(cand, fromStart = false) {
   if (!m) return '';
   s = m[0];
 
+  // 「阿公墨桑」「师父李三」：先剥称呼，剩下的才是名字
+  let titled = false;
+  if (fromStart) {
+    for (const t of TITLE_PREFIX_SORTED) {
+      if (s.startsWith(t) && s.length - t.length >= 2) { s = s.slice(t.length); titled = true; break; }
+    }
+  }
+
   let name;
   if (fromStart) {
-    if (s.length >= 3 && COMPOUND_SURNAMES.has(s.slice(0, 2))) name = s.slice(0, 3);
+    // 称呼 + 名字的写法几乎都是「称呼 + 双字名」（阿公墨桑 / 大哥张五），
+    // 套用下面的三字规则会把「墨桑盘」取成名字。
+    if (titled) name = (s.length >= 3 && COMPOUND_SURNAMES.has(s.slice(0, 2))) ? s.slice(0, 3) : s.slice(0, 2);
+    else if (s.length >= 3 && COMPOUND_SURNAMES.has(s.slice(0, 2))) name = s.slice(0, 3);
     // 三字名（卫天望 / 何足道）：第 3 字不是虚词或动词，才取三字
     else if (s.length >= 3 && !FUNCTION_TAIL_CHARS.includes(s[2])) name = s.slice(0, 3);
     else name = s.slice(0, 2);
@@ -303,6 +344,24 @@ function pickName(cand, fromStart = false) {
   return name;
 }
 
+/**
+ * 「名字 + 动作」：剥掉动作尾后只剩一个名字，就认为名字是主语。
+ * 用来认「”张三摇了摇头」「张三叹了口气：“…”」这类没有说话动词的提示语。
+ * 剥不掉任何东西时返回 ''（说明这串不是「名字+动作」，而是整段叙述）。
+ */
+function nameByAction(clause) {
+  const seg = stripPunct(clause);
+  if (seg.length < 3 || seg.length > 16) return '';
+  const cleaned = cleanCandidate(seg);
+  if (cleaned.length >= seg.length || cleaned.length < 2) return '';
+  // 剥完必须只剩一个短名字：否则「一张铁青的脸更加青了」剥掉状语后剩「一张铁青的脸青」，
+  // 会被取成「一张铁」这种假角色（真实章节实测踩到，卫天望的句子整段退回旁白）
+  if (cleaned.length > 4) return '';
+  const nm = pickName(cleaned, true);
+  if (!nm || nm.length !== cleaned.length) return '';
+  return nm;
+}
+
 /** 句末是否为「（名字）+ 说话动词」，是则返回动词与名字候选 */
 function verbAtEnd(seg) {
   if (!seg) return null;
@@ -321,6 +380,9 @@ function verbAtEnd(seg) {
   const head = seg.slice(0, bestEnd - bestVerb.length);
   // 挡住「知道 / 难道 / 味道 / 听说」
   if (bestVerb.length === 1 && head && VERB_FALSE_HEAD.includes(head[head.length - 1])) return null;
+  // 挡住「苏铭不敢开口」「他没说话」：动词前是否定/情态词，说明这句不是提示语。
+  // 不挡的话「不敢开口」会被切成一个叫「不敢」的角色。
+  if (head && /[不没未别敢肯愿想曾]$/.test(head)) return null;
   return { verb: bestVerb, head };
 }
 
@@ -385,6 +447,22 @@ function speakerFromPrefix(prefix) {
     if (name) return name;
   }
 
+  // 1.8) 「张三的声音传来：」「张三的语气一沉：」——名词性提示语，没有「说」但主语明确
+  for (let c = clauses.length - 1; c >= Math.max(0, clauses.length - 2); c--) {
+    const seg = stripPunct(clauses[c]);
+    const vm = seg.match(/^(.{2,6}?)的(?:声音|话音|嗓音|笑声|语气|喝声)/);
+    if (vm) {
+      const nm = pickName(vm[1], false);
+      if (nm) return nm;
+    }
+  }
+
+  // 1.9) 「张三叹了口气：“…”」「张三转身离去：“…”」：名字 + 动作尾，无说话动词
+  for (let c = clauses.length - 1; c >= Math.max(0, clauses.length - 2); c--) {
+    const nm = nameByAction(clauses[c]);
+    if (nm) return nm;
+  }
+
   // 2) 剧本式：整段就是名字（含说话动词说明不是名字）
   if (raw.length >= 1 && raw.length <= 4 && !STOP_NAMES.has(raw)
       && !SPEECH_VERBS.some(v => raw.includes(v))) {
@@ -406,8 +484,31 @@ function speakerFromPrefix(prefix) {
   return '';
 }
 
+/**
+ * 「称呼 + 名字」是强证据：「阿公墨桑」「师父李三」。这类名字即使整章只出现一次，
+ * 也应当当真名 —— 频率过滤（countOcc < 2 判噪声）只适合抓「郭襄心」这种误切片段。
+ */
+function strongNamesIn(sentence) {
+  const out = [];
+  const s = stripPunct(sentence);
+  if (!s) return out;
+  TITLE_PREFIX_RE.lastIndex = 0;
+  let m;
+  while ((m = TITLE_PREFIX_RE.exec(s))) {
+    const rest = s.slice(m.index + m[0].length);
+    const n = rest.match(/^[\u4e00-\u9fa5]{2,3}/);
+    if (!n) continue;
+    // 称呼后按双字名取（复姓三字），与 pickName 的 titled 分支保持一致
+    const cand = COMPOUND_SURNAMES.has(n[0].slice(0, 2)) ? n[0].slice(0, 3) : n[0].slice(0, 2);
+    if (!cand || cand.length < 2) continue;
+    if (STOP_NAMES.has(cand) || INTERJECTION.test(cand)) continue;
+    if (!out.includes(cand)) out.push(cand);
+  }
+  return out;
+}
+
 /** 从引号后的文字取说话人：「……”，张三说。」「……”，张三挑眉。」→ 张三 */
-function speakerFromSuffix(suffix) {
+function speakerFromSuffix(suffix, known) {
   const raw = stripPunct(suffix);
   if (!raw) return '';
 
@@ -429,11 +530,18 @@ function speakerFromSuffix(suffix) {
     if (name) return name;
   }
 
-  // 无动词：只有「短片段」才可能是「名字 + 动作」。
-  // 「”而已，居然能震破屋顶」这种长叙述若也取头两字，就会造出「而已」这类假角色。
-  if (first.length >= 2 && first.length <= 4) {
+  // 「”张三摇了摇头」「”张三一愣」：名字 + 动作尾，没有说话动词也是提示语。
+  // 判据是「剥掉动作尾后只剩名字」，与本章名单无关，因此单句也能认。
+  const byAct = nameByAction(first);
+  if (byAct) return byAct;
+
+  // 无说话动词，但「引号 + 名字 + 动作」也是明确的说话人标记，这是网文最常见的一种：
+  //   ”……照顾自己……” 阿公墨桑盘膝坐在那乌蟒上
+  // 短片段（≤4 字）直接认；长片段只有在名字是本章已知角色时才敢认，
+  // 否则「”而已，居然能震破屋顶」会被切出「而已」这种假角色。
+  if (first.length >= 2 && first.length <= 14) {
     const name = pickName(first, true);
-    if (name) return name;
+    if (name && (first.length <= 4 || (known && known.has(name)))) return name;
   }
   return '';
 }
@@ -478,6 +586,10 @@ export function genderScore(name, ctx = {}) {
   if (nf > nmc) s -= 3 * Math.min(nf - nmc, 2);
   else if (nmc > nf) s += 3 * Math.min(nmc - nf, 2);
 
+  // 叙述里的男性称呼（「阿公墨桑盘膝坐在」）：称呼是身份信息，比名字用字可靠。
+  // 只加 2 分，不足以翻掉名字里的强性别字（否则「阿婆身边的少女」会误判）。
+  if (NARR_M_TITLE.some(w => narr.includes(w))) s += 2;
+
   // 4) 名字用字：先剥掉姓氏 —— 「王语嫣」的「王」、「花铁干」的「花」都不是性别线索，
   //    不剥的话「王」会被当成男性字（王 → 公 → 男），女角色直接判反。
   const nm = String(name || '');
@@ -487,8 +599,11 @@ export function genderScore(name, ctx = {}) {
   const given = (nm.length >= 2 && SURNAMES.has(first) && !firstGendered) ? nm.slice(1) : nm;
 
   if (TITLE_F.some(w => nm.includes(w))) s -= 5;
-  // 「阿紫」「阿朱」「阿碧」：阿 + 单字是典型女性昵称
-  if (/^阿[\u4e00-\u9fa5]$/.test(nm)) s -= 3;
+  // 男性称呼：「阿公」「师父」「长老」「老爷子」。
+  // 旧版「阿X 判女」把「阿公」打成 -2，爷爷辈的角色会被配成女声（《求魔》实测踩到）。
+  if (TITLE_M.some(w => nm.startsWith(w))) s += 3;
+  // 「阿紫」「阿朱」「阿碧」：阿 + 单字是典型女性昵称；阿公 / 阿爷 这类长辈称呼除外
+  if (/^阿[\u4e00-\u9fa5]$/.test(nm) && !A_MALE.includes(nm[1])) s -= 3;
 
   let ns = 0;
   for (const ch of given) {
@@ -607,7 +722,27 @@ export function buildVoices(sentences, opt = {}) {
   const freqFilter = list.length >= 8;   // 句子太少时「出现次数」没有统计意义
   let lastSpeaker = '';
   let lastAt = -999;
+  let lastPure = false;      // 上一句对白是否「干净」（前后叙述都短），决定下一句能否沿用
   let unknownSeq = 0;
+
+  // 预扫一遍，收集「本章可信的角色名」：
+  //   a) 称呼 + 名字（阿公墨桑）——强证据，整章只出现一次也认；
+  //   b) 其他从提示语里切出的候选，需要在整章里出现 ≥2 次。
+  // 有了这份名单，引号后那段长叙述才敢取名字（否则只能取 ≤4 字的短片段）。
+  const known = new Set();
+  for (const s of list) {
+    for (const n of strongNamesIn(s)) known.add(n);
+  }
+  if (freqFilter) {
+    for (const s of list) {
+      if (!hasQuote(s)) continue;
+      const parts = splitAtQuote(s);
+      if (!parts) continue;
+      for (const cand of [speakerFromPrefix(parts.prefix), speakerFromSuffix(parts.suffix)]) {
+        if (cand && cand !== '那人' && !/^旁白对话\d$/.test(cand) && countOcc(fullText, cand) >= 2) known.add(cand);
+      }
+    }
+  }
 
   for (let i = 0; i < list.length; i++) {
     const s = String(list[i] || '');
@@ -624,7 +759,7 @@ export function buildVoices(sentences, opt = {}) {
     }
 
     const byPrefix = speakerFromPrefix(parts.prefix);
-    const bySuffix = byPrefix ? '' : speakerFromSuffix(parts.suffix);
+    const bySuffix = byPrefix ? '' : speakerFromSuffix(parts.suffix, known);
     let name = byPrefix || bySuffix;
     if (debug) debug.push({ i, text: s, prefix: parts.prefix, suffix: parts.suffix, byPrefix, bySuffix, name });
 
@@ -649,7 +784,10 @@ export function buildVoices(sentences, opt = {}) {
     }
     // 没有提示语（或是上一段台词的续句）：沿用上一位说话人。
     // 前缀里带说话动词却不给名字，说明这句是对白本身而非续句，交给后面归旁白。
-    if (!name && lastSpeaker && i - lastAt <= CARRY_LIMIT
+    // 另外要求「上一句是干净的对白」：像「”……照顾自己……” 阿公墨桑盘膝坐在那乌蟒上…」
+    // 这种台词后面拖了 40 多字叙述的，下一句光秃秃的引号多半已经换人说话了，
+    // 沿用上去只会把 A 的声音安到 B 头上 —— 宁可归到「未标注对白」。
+    if (!name && lastSpeaker && lastPure && i - lastAt <= CARRY_LIMIT
         && !SPEECH_VERBS.some(v => stripPunct(parts.prefix).includes(v))) {
       name = lastSpeaker;
     }
@@ -669,7 +807,7 @@ export function buildVoices(sentences, opt = {}) {
     // 真名会反复出现；宁可退回旁白，也不要凭空多出一个抢音色的假角色。
     // 章节太短时统计不可靠（一句话的样本里谁都只出现一次），此时不做过滤。
     if (name && freqFilter && name !== '那人' && !/^旁白对话\d$/.test(name)
-        && countOcc(fullText, name) < 2) {
+        && !known.has(name) && countOcc(fullText, name) < 2) {
       name = '';
     }
     if (debug && debug.length) debug[debug.length - 1].name = name;
@@ -696,6 +834,7 @@ export function buildVoices(sentences, opt = {}) {
     role.count++;
     lastSpeaker = name;
     lastAt = i;
+    lastPure = stripPunct(parts.suffix).length <= 30;   // 只看引号后的叙述长度：过长的叙述后常已换人
 
     voices[i] = name;              // 先存名字，最后统一翻译成 voiceId
   }
