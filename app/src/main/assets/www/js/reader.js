@@ -2,10 +2,12 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.41';
-import { settings, saveSettings } from './settings.js?v=1.41';
-import { splitSentences } from './parser.js?v=1.41';
-import { Speaker } from './tts.js?v=1.41';
+import { db, newId } from './db.js?v=1.52';
+import { settings, saveSettings } from './settings.js?v=1.52';
+import { splitSentences } from './parser.js?v=1.52';
+import { Speaker } from './tts.js?v=1.52';
+import { buildVoices } from './roles.js?v=1.52';
+import { roleBookOf } from './rolebook.js?v=1.52';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -17,6 +19,8 @@ export const reader = {
   chapterIndex: 0,
   chapter: null,
   sentences: [],
+  voices: [],        // 与 sentences 平行：null = 旁白音色，非空 = 角色固定音色
+  roles: [],         // 本章识别出的角色 [{name, gender, voiceId, count}]
   spans: [],
   speaker: new Speaker(),
   page: 0,
@@ -46,6 +50,7 @@ export const reader = {
 
     this.speaker.on({
       getSentences: () => this.sentences,
+      getVoices: () => this.voices,
       getMeta: () => ({
         book: this.book ? this.book.title : '',
         bookId: this.book ? this.book.id : '',
@@ -253,6 +258,57 @@ export const reader = {
     return true;
   },
 
+  /** 当前旁白音色 id（原生优先，取不到再用网页设置） */
+  currentVoiceId() {
+    try {
+      if (window.AndroidTTS && window.AndroidTTS.getVoiceId) {
+        const v = window.AndroidTTS.getVoiceId();
+        if (v) return v;
+      }
+    } catch (e) { /* ignore */ }
+    return settings.ttsVoice || '';
+  },
+
+  /** 本书的角色档案（跨章一致 + 一人一音都靠它） */
+  roleBook() {
+    if (!this.book) return null;
+    return roleBookOf(this.book.id);
+  },
+
+  /** 多角色朗读的选项：开关、旁白音色、用户手动指定的角色音色、书级角色档案 */
+  roleOptions(chapter) {
+    // 角色音色覆盖按书隔离：A 书把「张三」调成云扬，不该影响 B 书的「张三」。
+    // 存储键是 `${bookId}|${角色名}`，这里剥回角色名交给 buildVoices。
+    const bid = (this.book && this.book.id) || '';
+    const prefix = bid ? bid + '|' : '';
+    const own = {};
+    const all = settings.roleOverrides || {};
+    for (const k of Object.keys(all)) {
+      if (prefix && k.startsWith(prefix)) own[k.slice(prefix.length)] = all[k];
+      else if (!prefix) own[k] = all[k];
+    }
+    const book = this.roleBook();
+    // 换章要清掉「已投票」标记，否则后面每一章都拿不到新的性别证据
+    if (book) book.beginChapter(chapter == null ? this.chapterIndex : chapter);
+    return {
+      enabled: settings.multiRole !== false,
+      narration: this.currentVoiceId(),
+      overrides: own,
+      book,
+    };
+  },
+
+  /** 重新计算当前章每一句的音色（换章、换旁白音色、改角色设置后都要调） */
+  refreshRoles() {
+    const opt = this.roleOptions(this.chapterIndex);
+    const rv = buildVoices(this.sentences, opt);
+    this.voices = rv.voices;
+    this.roles = rv.roles;
+    // 本章可能给新角色定了性别、分了音色：落盘，下次开 App 还是同一套声音
+    if (opt.book) opt.book.save();
+    if (this.onRoles) { try { this.onRoles(this.roles); } catch (e) { /* ignore */ } }
+  },
+
   /**
    * 收集 fromChapter 起的 count 章句子，交给原生连续播放（锁屏/后台跨章的核心）。
    * 当前章直接用已切好的 this.sentences，其余章现读现切。
@@ -263,21 +319,29 @@ export const reader = {
     const end = Math.min(fromChapter + (count || 8), this.titles.length);
     for (let i = fromChapter; i < end; i++) {
       let sents = null;
+      let vs = null;
       if (i === this.chapterIndex && this.sentences.length) {
         sents = this.sentences.slice();
+        // 音色表与句子必须等长，否则宁可不带（退回旁白）
+        if (this.voices && this.voices.length === sents.length) vs = this.voices.slice();
       } else {
         const ch = await db.getChapter(this.book.id, i);
         if (!ch) break;
         sents = [];
         String(ch.text || '').split(/\n+/).map(s => s.trim()).filter(Boolean)
           .forEach(p => { for (const s of splitSentences(p)) sents.push(s); });
+        vs = buildVoices(sents, this.roleOptions(i)).voices;
       }
       if (!sents.length) break;   // 遇到空章就停，避免章节序号错位
       out.push({
         t: (this.titles[i] && this.titles[i].title) || ('第 ' + (i + 1) + ' 章'),
         s: sents,
+        v: vs || null,
       });
     }
+    // 预读的这几章可能引入了新角色：一次性落盘，避免每章都写 localStorage
+    const bk = this.roleBook();
+    if (bk) bk.save();
     return JSON.stringify(out);
   },
 
@@ -327,6 +391,7 @@ export const reader = {
     }).join('');
     this.el.text.innerHTML = html || '<p style="text-indent:0">（本章无内容）</p>';
     this.spans = Array.from(this.el.text.querySelectorAll('.sent'));
+    this.refreshRoles();
 
     // 章末信息
     const rest = this.titles.length - index - 1;

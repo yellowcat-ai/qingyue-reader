@@ -12,7 +12,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/app.css?v=1.41">
+<link rel="stylesheet" href="css/app.css?v=1.52">
 </head>
 <body>
 
@@ -270,6 +270,14 @@
         <div class="set-d" id="tts-voice-tip">在线音色由微软 / 百度语音合成提供，需联网</div>
       </div>
       <div class="set-group">
+        <div class="set-row">
+          <div><div class="set-t">多角色朗读</div><div class="set-d">对白换角色音色，旁白用上面的音色</div></div>
+          <label class="switch"><input type="checkbox" id="sw-roles"><i></i></label>
+        </div>
+        <div id="role-list" class="role-list" hidden></div>
+        <div class="set-d" id="role-tip" hidden></div>
+      </div>
+      <div class="set-group">
         <label class="set-label">语速 <b id="val-rate">1.0</b>×</label>
         <input type="range" id="rng-rate" min="0.5" max="2" step="0.1" value="1">
       </div>
@@ -364,6 +372,6 @@
 
 <script src="vendor/jszip.min.js"></script>
 <script src="vendor/pdfjs/pdf.min.js"></script>
-<script type="module" src="js/app.js?v=1.46"></script>
+<script type="module" src="js/app.js?v=1.52"></script>
 </body>
 </html>

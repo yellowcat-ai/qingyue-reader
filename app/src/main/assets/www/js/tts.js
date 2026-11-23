@@ -19,10 +19,11 @@ export class Speaker {
     this.supported = !!synth || isNativeApp();
     this.native = isNativeApp() ? window.AndroidTTS : null;
     this.queueMode = !!this.native;
-    this.voices = [];
+    this.sysVoices = [];    // 系统语音列表（SpeechSynthesisVoice[]，仅浏览器路径用）
     this.playing = false;
     this.paused = false;
     this.sentences = [];
+    this.voices = [];       // 与 sentences 平行：null = 旁白音色，非空 = 角色音色
     this.index = 0;
     this.total = 0;
     this.chapter = -1;      // 原生当前朗读的章节序号（-1 = 未知）
@@ -34,6 +35,7 @@ export class Speaker {
 
     this.hooks = {
       getSentences: () => [],          // () => string[]
+      getVoices: () => [],             // () => (string|null)[] 与句子平行，null = 旁白
       getMeta: () => ({ book: '', chapter: '', chapterIndex: 0 }), // 用于通知栏显示
       collectChapters: async () => '[]', // (fromChapter, count) => JSON 多章句子
       onRemoteChapter: () => {},        // (chapterIndex, title) 原生读到新章时通知网页
@@ -204,8 +206,8 @@ export class Speaker {
     if (this.native) return [];
     if (!this.supported) return [];
     const list = synth.getVoices() || [];
-    if (list.length) this.voices = list;
-    return this.voices;
+    if (list.length) this.sysVoices = list;
+    return this.sysVoices;
   }
 
   /** 中文音色优先排序 */
@@ -216,7 +218,9 @@ export class Speaker {
         return arr.map(v => ({ voiceURI: v.name, name: v.name, lang: v.locale, localService: true }));
       } catch (e) { return []; }
     }
-    const vs = this.voices.length ? this.voices : this.loadVoices();
+    // 注意：here 必须用 sysVoices。this.voices 是「每句对应的角色音色」，
+    // 两者混用会让浏览器路径把角色表当系统音色表排序，导致音色选择整体失效。
+    const vs = this.sysVoices.length ? this.sysVoices : this.loadVoices();
     const score = v => {
       const l = (v.lang || '').toLowerCase();
       if (/^zh|^cmn/.test(l)) return l.includes('cn') || l.includes('hans') ? 0 : 1;
@@ -231,6 +235,21 @@ export class Speaker {
     return this.voiceOptions().find(v => v.voiceURI === uri) || null;
   }
 
+  /**
+   * 宽松匹配：多角色给的是原生音色 id（edge:zh-CN-YunxiNeural），
+   * 浏览器里没有这个 id，就按「Yunxi」这样的短名去找同名系统音色。
+   * 安卓 APP 走原生队列，用不到这里。
+   */
+  findVoiceLoose(vid) {
+    if (!vid) return null;
+    const direct = this.findVoice(vid);
+    if (direct) return direct;
+    const short = String(vid).split(':').pop()
+      .replace(/^zh-[A-Z]{2}-/, '').replace(/Neural$/, '').toLowerCase();
+    if (!short) return null;
+    return this.voiceOptions().find(v => (v.name || '').toLowerCase().includes(short)) || null;
+  }
+
   on(events) { Object.assign(this.hooks, events); return this; }
 
   /* ---------------- 播放控制 ---------------- */
@@ -238,6 +257,7 @@ export class Speaker {
   async play(startIndex = -1, opt = {}) {
     if (!this.supported) { this.hooks.onError('当前浏览器不支持语音朗读'); return; }
     this.sentences = this.hooks.getSentences() || [];
+    this.voices = this.hooks.getVoices ? (this.hooks.getVoices() || []) : [];
     if (!this.sentences.length) { this.hooks.onError('本章没有可朗读的内容'); return; }
     if (startIndex >= 0) this.index = Math.min(startIndex, this.sentences.length - 1);
     if (this.index >= this.sentences.length) this.index = 0;
@@ -286,7 +306,8 @@ export class Speaker {
       payload = await this.hooks.collectChapters(base, Speaker.PREFETCH);
     } catch (e) { payload = ''; }
     if (!payload || payload === '[]') {
-      payload = JSON.stringify([{ t: meta.chapter || '', s: this.sentences }]);
+      const vs = (this.voices && this.voices.length === this.sentences.length) ? this.voices : null;
+      payload = JSON.stringify([{ t: meta.chapter || '', s: this.sentences, v: vs }]);
     }
 
     try {
@@ -326,7 +347,9 @@ export class Speaker {
     const my = ++this.token;
     const voiceURI = this.opt && this.opt.voiceURI;
     const u = new SpeechSynthesisUtterance(text);
-    const v = this.findVoice(voiceURI);
+    // 多角色：本句若指定了角色音色就优先用；找不到对应系统音色时退回旁白音色
+    const roleVoice = (this.voices && this.voices[i]) || '';
+    const v = this.findVoiceLoose(roleVoice) || this.findVoice(voiceURI);
     if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = (this.opt && this.opt.lang) || 'zh-CN'; }
     u.rate = this.opt && this.opt.rate ? this.opt.rate : 1;
     u.pitch = this.opt && this.opt.pitch ? this.opt.pitch : 1;

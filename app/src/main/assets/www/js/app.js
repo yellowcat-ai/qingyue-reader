@@ -2,12 +2,14 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js?v=1.41';
-import { settings, saveSettings } from './settings.js?v=1.41';
-import { parseFile } from './parser.js?v=1.41';
-import { reader } from './reader.js?v=1.41';
-import { pdfview } from './pdfview.js?v=1.45';
-import { ttsSupported, isNativeApp } from './tts.js?v=1.41';
+import { db, newId, storageInfo } from './db.js?v=1.52';
+import { settings, saveSettings } from './settings.js?v=1.52';
+import { parseFile } from './parser.js?v=1.52';
+import { reader } from './reader.js?v=1.52';
+import { pdfview } from './pdfview.js?v=1.52';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.52';
+import { roleLabel, MALE_POOL, FEMALE_POOL } from './roles.js?v=1.52';
+import { baseOf, pitchOf, slotOf, PITCH_STEPS } from './rolebook.js?v=1.52';
 
 const $ = id => document.getElementById(id);
 const GRADS = [
@@ -28,6 +30,8 @@ const app = {
     reader.init();
     reader.onToast = m => this.toast(m);
     reader.onTtsState = s => this.onTtsState(s);
+    // 后台原生跨章时网页会跟着换章，角色列表也要跟着变
+    reader.onRoles = () => this.renderRoles();
 
     pdfview.init();
     pdfview.onToast = m => this.toast(m);
@@ -660,6 +664,8 @@ const app = {
     if (swS) swS.checked = s.seamless !== false;
     const swJ = $('sw-join');
     if (swJ) swJ.checked = s.joinShort !== false;
+    const swR = $('sw-roles');
+    if (swR) swR.checked = s.multiRole !== false;
     document.querySelectorAll('#theme-picker button').forEach(b => b.classList.toggle('on', b.dataset.theme === s.theme));
     document.querySelectorAll('#seg-family button').forEach(b => b.classList.toggle('on', b.dataset.v === s.family));
     document.querySelectorAll('#seg-scroll button').forEach(b => b.classList.toggle('on', b.dataset.v === s.scrollMode));
@@ -691,6 +697,15 @@ const app = {
     });
     $('tts-prev').addEventListener('click', () => reader.speaker.prev());
     $('tts-next').addEventListener('click', () => reader.speaker.next());
+
+    const swRoles = $('sw-roles');
+    if (swRoles) swRoles.addEventListener('change', e => {
+      saveSettings({ multiRole: e.target.checked });
+      reader.refreshRoles();
+      this.renderRoles();
+      this.restartForVoices();
+      this.toast(e.target.checked ? '多角色朗读已开启' : '已关闭，全部用旁白音色');
+    });
 
     $('tts-voice').addEventListener('change', e => {
       saveSettings({ ttsVoice: e.target.value });
@@ -743,7 +758,7 @@ const app = {
     $('btn-battery').textContent = ok ? '去查看' : '去设置';
   },
 
-  startListen() {
+  startListen(startAt) {
     if (!ttsSupported()) { this.toast('当前浏览器不支持语音朗读'); return; }
     const sp = reader.speaker;
     if (!reader.book) { this.toast('请先打开一本书'); return; }
@@ -751,13 +766,18 @@ const app = {
 
     this.openSheet('sheet-tts');
     this.fillVoices();
+    // 每次起播都按当前设置重算一遍逐句音色（旁白音色可能刚被换过）
+    reader.refreshRoles();
+    this.renderRoles();
     if (window.AndroidTTS && window.AndroidTTS.setSeamless) {
       try { window.AndroidTTS.setSeamless(settings.seamless !== false); } catch (e) { /* ignore */ }
     }
     if (window.AndroidTTS && window.AndroidTTS.setJoinShort) {
       try { window.AndroidTTS.setJoinShort(settings.joinShort !== false); } catch (e) { /* ignore */ }
     }
-    const start = reader.currentBlock ? reader.currentBlock() : 0;
+    const start = (typeof startAt === 'number' && startAt >= 0)
+      ? startAt
+      : (reader.currentBlock ? reader.currentBlock() : 0);
     sp.play(start, {
       rate: settings.ttsRate,
       pitch: settings.ttsPitch,
@@ -768,6 +788,120 @@ const app = {
       seamless: settings.seamless !== false,
       joinShort: settings.joinShort !== false,
     });
+  },
+
+  /** 播放中改了音色分配：从当前句重新起播（原生队列要重新下发才带新音色） */
+  restartForVoices() {
+    const sp = reader.speaker;
+    if (!sp.playing) return;
+    const at = sp.index || 0;
+    sp.stop();
+    setTimeout(() => { if (!reader.speaker.playing) this.startListen(at); }, 160);
+  },
+
+  /** 音色目录（原生下才有在线音色列表） */
+  voiceCatalog() {
+    if (isNativeApp() && window.AndroidTTS && window.AndroidTTS.getVoiceList) {
+      try { return JSON.parse(window.AndroidTTS.getVoiceList() || '[]'); } catch (e) { return []; }
+    }
+    return [];
+  },
+
+  /** 听书面板里的角色列表：点一下换一个音色 */
+  renderRoles() {
+    const box = $('role-list');
+    const tip = $('role-tip');
+    if (!box) return;
+    const roles = reader.roles || [];
+    if (settings.multiRole === false) { box.hidden = true; box.innerHTML = ''; if (tip) tip.hidden = true; return; }
+    if (!roles.length) {
+      box.hidden = true;
+      box.innerHTML = '';
+      if (tip) { tip.hidden = false; tip.textContent = '本章没识别到对白，整章用旁白音色朗读'; }
+      return;
+    }
+    const list = this.voiceCatalog();
+    // 音色名 + 音高后缀：'edge:zh-CN-YunxiNeural@-10' → '云希 ↓10'
+    const nameOf = id => {
+      if (!id) return '旁白';
+      const base = baseOf(id);
+      const hit = list.find(v => v.id === base);
+      const nm = hit ? hit.name : base.replace(/^edge:[a-zA-Z-]+-/, '');
+      const hz = pitchOf(id);
+      return hz ? `${nm} ${hz > 0 ? '↑' : '↓'}${Math.abs(hz)}` : nm;
+    };
+    box.hidden = false;
+    box.innerHTML = roles.map(r =>
+      `<button class="role-chip" data-role="${escapeHtml(r.name)}">` +
+      `<b>${escapeHtml(roleLabel(r.name))}</b>` +
+      `<span>${escapeHtml(nameOf(r.voiceId))} · ${r.count}句</span></button>`
+    ).join('') +
+      `<button class="role-chip role-reset" data-role-reset="1">` +
+      `<b>重排全书音色</b><span>清空角色档案后重新分配</span></button>`;
+    box.querySelectorAll('[data-role]').forEach(btn => {
+      btn.addEventListener('click', () => this.cycleRoleVoice(btn.dataset.role));
+    });
+    box.querySelectorAll('[data-role-reset]').forEach(btn => {
+      btn.addEventListener('click', () => this.resetRoleBook());
+    });
+    if (tip) {
+      tip.hidden = false;
+      let t = '点角色换下一个音色（含音高变体），改完立即生效；整本书同一角色始终同一个声音';
+      if (roles.filter(r => r.gender === 'f').length > 3) {
+        t += '。女性角色多于 3 个时会用同一音色的不同音高区分';
+      }
+      tip.textContent = t;
+    }
+  },
+
+  /** 清空本书的角色档案：性别与音色全部重新识别 */
+  resetRoleBook() {
+    const bk = reader.roleBook();
+    if (!bk) return;
+    bk.reset();
+    reader.refreshRoles();
+    this.renderRoles();
+    this.restartForVoices();
+    this.toast('已重排本书角色音色');
+  },
+
+  /**
+   * 换角色音色。走「槽」而不是「音色」：Edge 普通话只有 7 个音色，
+   * 一部长篇的角色数远多于 7，靠音高变体才能做到一人一音，轮换必须在这个空间里进行。
+   */
+  cycleRoleVoice(name) {
+    const roles = reader.roles || [];
+    const r = roles.find(x => x.name === name);
+    if (!r) return;
+    const isF = r.gender === 'f';
+    const pool = isF ? FEMALE_POOL : MALE_POOL;
+    const cands = [];
+    for (const hz of PITCH_STEPS[isF ? 'f' : 'm']) for (const b of pool) cands.push(slotOf(b, hz));
+    // 别人（含旁白）已占用的槽不能选，否则一人一音就破了
+    const used = new Set(roles.filter(x => x.name !== name).map(x => x.voiceId).filter(Boolean));
+    const narration = reader.currentVoiceId();
+    if (narration) used.add(narration);
+    const at = cands.indexOf(r.voiceId);
+    let next = '';
+    for (let k = 1; k <= cands.length; k++) {
+      const c = cands[(at + k) % cands.length];
+      if (!used.has(c)) { next = c; break; }
+    }
+    if (!next) { this.toast('音色槽已用尽'); return; }
+
+    const bk = reader.roleBook();
+    if (bk) bk.setVoice(name, next);
+    // 旧的全局覆盖会压过档案，同步清掉，避免「点了没反应」
+    const bid = (reader.book && reader.book.id) || '';
+    const key = bid ? bid + '|' + name : name;
+    if (settings.roleOverrides && settings.roleOverrides[key]) {
+      const ov = Object.assign({}, settings.roleOverrides);
+      delete ov[key];
+      saveSettings({ roleOverrides: ov });
+    }
+    reader.refreshRoles();
+    this.renderRoles();
+    this.restartForVoices();
   },
 
   fillVoices() {
@@ -799,9 +933,14 @@ const app = {
             try { window.AndroidTTS.setVoiceId(vid); } catch (e) { /* ignore */ }
             grid.querySelectorAll('.voice-card').forEach(b => b.classList.toggle('on', b === btn));
             this.toast(`已切换到「${btn.querySelector('b').textContent}」`);
+            // 旁白换了，角色音色可能撞色：重算并刷新角色列表
+            const clash = (reader.roles || []).some(r => r.voiceId === vid);
+            reader.refreshRoles();
+            this.renderRoles();
             if (reader.speaker.playing) {
-              // 正在朗读：直接用新音色重读当前句（不打断阅读节奏）
-              reader.speaker.restartCurrent();
+              // 撞色要整队重新下发；否则只重读当前句，不打断节奏
+              if (clash) this.restartForVoices();
+              else reader.speaker.restartCurrent();
             } else {
               try { window.AndroidTTS.testSpeak(); } catch (e) { /* ignore */ }
             }

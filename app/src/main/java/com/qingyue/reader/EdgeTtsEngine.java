@@ -581,12 +581,28 @@ public class EdgeTtsEngine {
     /**
      * 2) 文本帧。返回 false 表示这条连接已经不可用（OkHttp 在连接关闭时 send 只返回 false
      * 而不抛异常），调用方应立即重连，否则要白等一次合成超时。
+     *
+     * voice 允许带音高后缀：「zh-CN-YunxiNeural@-10」= 云希降 10Hz 来念这一句。
+     * 普通话只有 7 个音色，而一部长篇的角色有十几二十个，靠「基础音色 × 音高」
+     * 才能做到一人一音。后缀不参与 SSML 的 name 属性，只喂给 prosody 的 pitch。
+     * 注意单位只能是 Hz：实测传「+10%」会被服务端拒绝（客户端库直接抛 ValueError），
+     * 「+10Hz / -10Hz」都能正常出音且波形不同。
      */
     private static boolean sendSsml(WebSocket ws, String text, String voice, float rate) {
         int pct = Math.round((rate - 1f) * 100);
+        String name = voice;
+        int pitchHz = 0;
+        int at = voice == null ? -1 : voice.indexOf('@');
+        if (at >= 0) {
+            name = voice.substring(0, at);
+            try {
+                pitchHz = Math.max(-60, Math.min(60, Integer.parseInt(voice.substring(at + 1).trim())));
+            } catch (Throwable ignore) { pitchHz = 0; }
+        }
+        String pitchStr = (pitchHz >= 0 ? "+" : "") + pitchHz + "Hz";
         String ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>"
-                + "<voice name='" + voice + "'>"
-                + "<prosody pitch='+0Hz' rate='" + (pct >= 0 ? "+" : "") + pct + "%' volume='+0%'>"
+                + "<voice name='" + name + "'>"
+                + "<prosody pitch='" + pitchStr + "' rate='" + (pct >= 0 ? "+" : "") + pct + "%' volume='+0%'>"
                 + escapeXml(text) + "</prosody></voice></speak>";
         return ws.send("X-RequestId:" + UUID.randomUUID().toString().replace("-", "") + "\r\n"
                 + "X-Timestamp:" + dateStr() + "\r\n"

@@ -144,6 +144,10 @@ public class NativeTTS {
     private static final String[][] VOICE_TABLE = {
             {"edge:zh-CN-XiaoxiaoNeural", "晓晓", "温柔女声 · 推荐", "online"},
             {"edge:zh-CN-XiaoyiNeural", "晓伊", "甜美少女音", "online"},
+            // 晓萱不在 readaloud 官方音色清单里，但实测（edge-tts 7.3.1，长短文本均正常出音、
+            // 与晓伊字节数一致但 md5 不同）确认服务端可用。它把普通话女声从 2 个补到 3 个。
+            // 若将来被下线，playOnce 会依次降级到百度、系统 TTS，不会静音。
+            {"edge:zh-CN-XiaoxuanNeural", "晓萱", "清亮女声 · 表现力强", "online"},
             {"edge:zh-CN-YunxiNeural", "云希", "青年男声 · 自然", "online"},
             {"edge:zh-CN-YunjianNeural", "云健", "浑厚男声 · 解说风", "online"},
             {"edge:zh-CN-YunyangNeural", "云扬", "新闻播报 · 沉稳", "online"},
@@ -168,11 +172,23 @@ public class NativeTTS {
     private static volatile NativeTTS INSTANCE;
     private final List<String> queue = new ArrayList<>();
 
+    /**
+     * 与 queue 一一对应的音色（多角色朗读）。
+     * null / "" / "default" 表示「跟随当前音色」（旁白句），
+     * 非空则是该句固定的音色 id（角色句），不受全局音色切换影响。
+     */
+    private final List<String> qVoice = new ArrayList<>();
+
     /** 已排队待播的后续章节（原生自主跨章用） */
     private static class Seg {
         final String title;
         final List<String> s;
-        Seg(String t, List<String> s) { this.title = t == null ? "" : t; this.s = s; }
+        final List<String> v;      // 与 s 等长，可为空
+        Seg(String t, List<String> s, List<String> v) {
+            this.title = t == null ? "" : t;
+            this.s = s;
+            this.v = v;
+        }
     }
     private final List<Seg> qPending = new ArrayList<>();
     private volatile int qChapter = 0;           // 当前章节的全局序号（与书籍目录一致）
@@ -653,10 +669,21 @@ public class NativeTTS {
         return i >= 0 ? vid.substring(i + 1) : "zh-CN-XiaoxiaoNeural";
     }
 
+    /**
+     * 展示名。vid 可能带音高后缀（多角色时同一音色靠音高区分不同人物）：
+     * "edge:zh-CN-YunxiNeural@-10" → "云希 ↓10"
+     */
     private static String voiceDisplayName(String vid) {
-        for (String[] v : VOICE_TABLE) if (v[0].equals(vid)) return v[1];
-        if ("system".equals(vid)) return "系统语音";
-        return "晓晓";
+        int at = vid == null ? -1 : vid.indexOf('@');
+        String base = at >= 0 ? vid.substring(0, at) : vid;
+        int hz = 0;
+        if (at >= 0) {
+            try { hz = Integer.parseInt(vid.substring(at + 1).trim()); } catch (Throwable ignore) { hz = 0; }
+        }
+        String suffix = hz == 0 ? "" : (hz > 0 ? " ↑" + hz : " ↓" + Math.abs(hz));
+        for (String[] v : VOICE_TABLE) if (v[0].equals(base)) return v[1] + suffix;
+        if ("system".equals(base)) return "系统语音";
+        return "晓晓" + suffix;
     }
 
     /** 试读一句，验证当前引擎是否真的能出声 */
@@ -669,6 +696,8 @@ public class NativeTTS {
             main.post(() -> {
                 qToken++;
                 stopPlaybackInternal();
+                // 当前句可能是角色句，试听要让用户听到「刚选的旁白音色」，只对这一句生效
+                qForceVoiceOnce = vid;
                 playAt(qIndex);
             });
             fireTest(true);
@@ -841,8 +870,12 @@ public class NativeTTS {
         default void onStart(long durMs) { }
     }
 
-    private void playOnce(final String text, final String nextText, final Once cb, final int token) {
-        final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
+    private void playOnce(final String text, final String nextText, final String voiceOverride,
+                          final Once cb, final int token) {
+        // 角色句用自带音色；旁白句（null）跟随当前全局音色
+        final String vid = (voiceOverride == null || voiceOverride.isEmpty() || "default".equals(voiceOverride))
+                ? (voiceId == null ? DEFAULT_VOICE_ID : voiceId)
+                : voiceOverride;
         final String clean = text == null ? "" : text.trim();
         if (clean.isEmpty()) { cb.onResult(true); return; }
 
@@ -920,7 +953,7 @@ public class NativeTTS {
             }
             if (list.isEmpty()) { evalJs("window.__ttsQueueError&&window.__ttsQueueError('本章没有可朗读的内容')"); return; }
             List<Seg> one = new ArrayList<>();
-            one.add(new Seg(chapterTitle, list));
+            one.add(new Seg(chapterTitle, list, null));
             startSegs(one, startIndex, bookTitle, 0, timerMin);
         });
     }
@@ -970,11 +1003,25 @@ public class NativeTTS {
                 List<String> list = new ArrayList<>();
                 if (ss != null) {
                     for (int j = 0; j < ss.length(); j++) {
-                        String s = ss.optString(j, "");
+                        String s = ss.isNull(j) ? "" : ss.optString(j, "");
                         list.add(s == null ? "" : s);
                     }
                 }
-                if (!list.isEmpty()) out.add(new Seg(o.optString("t", ""), list));
+                // 逐句音色（多角色）：缺省或长度不符时按 null 补齐，等于全部走旁白
+                JSONArray vv = o.optJSONArray("v");
+                List<String> voices = new ArrayList<>();
+                if (vv != null && vv.length() > 0) {
+                    for (int j = 0; j < list.size(); j++) {
+                        // org.json 的 optString 会把 JSON null 读成字符串 "null"，必须先判 isNull
+                        if (j < vv.length() && !vv.isNull(j)) {
+                            String v = vv.optString(j, "");
+                            voices.add((v == null || v.isEmpty() || "null".equals(v) || "default".equals(v)) ? null : v);
+                        } else {
+                            voices.add(null);
+                        }
+                    }
+                }
+                if (!list.isEmpty()) out.add(new Seg(o.optString("t", ""), list, voices.isEmpty() ? null : voices));
             }
         } catch (Throwable t) {
             Log.w(TAG, "parseSegs: " + t);
@@ -988,6 +1035,9 @@ public class NativeTTS {
         if (segs.size() > 1) qPending.addAll(segs.subList(1, segs.size()));
         queue.clear();
         queue.addAll(segs.get(0).s);
+        qVoice.clear();
+        if (segs.get(0).v != null) qVoice.addAll(segs.get(0).v);
+        while (qVoice.size() < queue.size()) qVoice.add(null);
         qTitle = segs.get(0).title;
         qChapter = Math.max(0, baseChapter);
         qBook = bookTitle == null ? "" : bookTitle;
@@ -1031,6 +1081,9 @@ public class NativeTTS {
         Seg seg = qPending.remove(0);
         queue.clear();
         queue.addAll(seg.s);
+        qVoice.clear();
+        if (seg.v != null) qVoice.addAll(seg.v);
+        while (qVoice.size() < queue.size()) qVoice.add(null);
         qTitle = seg.title;
         qChapter++;
         qIndex = 0;
@@ -1069,13 +1122,26 @@ public class NativeTTS {
         return s == null ? "" : s.trim();
     }
 
+    /** 某句应使用的音色：null = 跟随当前（旁白），非空 = 角色固定音色 */
+    private static String voiceAtIn(List<String> voices, int i) {
+        if (voices == null || i < 0 || i >= voices.size()) return null;
+        return voices.get(i);
+    }
+
+    private static String normVoice(String v) {
+        return (v == null || v.isEmpty() || "null".equals(v) || "default".equals(v)) ? "" : v;
+    }
+
     /** 从 i 起的一个朗读单元结束位置（exclusive）。joinShort 关闭时恒为 i+1 */
-    private int unitEndIn(List<String> list, int i) {
+    private int unitEndIn(List<String> list, List<String> voices, int i) {
         final int size = list.size();
         if (i >= size) return i;
         if (!joinShort) return i + 1;
+        final String v0 = normVoice(voiceAtIn(voices, i));
         int end = i, chars = 0;
         while (end < size && end - i < UNIT_MAX_SENT) {
+            // 换角色就断单元：不同音色不能合进同一段音频，否则会串音
+            if (end > i && !normVoice(voiceAtIn(voices, end)).equals(v0)) break;
             int l = sOf(list, end).length();
             if (l == 0) { if (end == i) end++; break; }   // 空句自己占一个单元，交给 playAt 跳过
             if (end > i && chars + l > UNIT_TARGET + 16) break;
@@ -1087,7 +1153,7 @@ public class NativeTTS {
         return end <= i ? i + 1 : end;
     }
 
-    private int unitEnd(int i) { return unitEndIn(queue, i); }
+    private int unitEnd(int i) { return unitEndIn(queue, qVoice, i); }
 
     /** 把 [from,to) 拼成一段合成文本；句子自带标点就直接接，缺了就补个逗号 */
     private static String unitTextIn(List<String> list, int from, int to) {
@@ -1153,9 +1219,17 @@ public class NativeTTS {
         final int token = ++qToken;
         final int end = Math.min(unitEnd(i), queue.size());      // 本朗读单元的结束（exclusive）
         final String text = unitTextIn(queue, i, end);
+        // 本单元的音色：null 表示旁白（跟随当前音色），非空为角色固定音色
+        // 试听时 qForceVoiceOnce 会临时覆盖一句，让用户听到刚选的旁白音色
+        final String forced = qForceVoiceOnce;
+        qForceVoiceOnce = null;
+        final String vid = forced != null ? forced : voiceAtIn(qVoice, i);
         // 下一个单元也一并交给原生层提前 prepare，播完直接接棒（跨章不接，跨章要整段换队列）
         final int nextEnd = end < queue.size() ? Math.min(unitEnd(end), queue.size()) : end;
-        final String nextText = nextEnd > end ? unitTextIn(queue, end, nextEnd) : null;
+        String nt = nextEnd > end ? unitTextIn(queue, end, nextEnd) : null;
+        // 下一单元换了角色就不能接棒：Edge 的接棒机制会把同一音色的音频续上，串音很明显
+        if (nt != null && (forced != null || !normVoice(voiceAtIn(qVoice, end)).equals(normVoice(vid)))) nt = null;
+        final String nextText = nt;
         qIndex = i;
         saveQueuePos(false);          // 后台/被杀也留个位置（有节流，不会频繁写盘）
 
@@ -1176,7 +1250,7 @@ public class NativeTTS {
         };
         main.postDelayed(push, 400);
 
-        playOnce(text, nextText, new Once() {
+        playOnce(text, nextText, vid, new Once() {
             @Override public void onStart(long durMs) {
                 if (token != qToken) return;
                 if (durMs > 0) durBox[0] = durMs;
@@ -1226,44 +1300,49 @@ public class NativeTTS {
      * 每段都要现下载，弱网下停顿 1~3 秒——这是「换个音色就好了」的真正原因。
      */
     private void prefetchAhead(final int i) {
-        final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
-        final boolean isEdge = vid.startsWith("edge:");
-        final boolean isBaidu = vid.startsWith("baidu:");
-        if (!isEdge && !isBaidu) return;             // 系统语音本地合成，无需预取
-        final String v = voiceShortName(vid);
+        final String defVid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
         // 一个单元通常 20~40 字（约 5~9 秒），预取 4 个就是半分钟上下，够扛住网络抖动
         int k = unitEnd(i);
         int n = 0;
         while (n < PREFETCH_DEPTH && k < queue.size()) {
             int e = Math.min(unitEnd(k), queue.size());
-            prefetchUnit(unitTextIn(queue, k, e), v, isEdge);
+            prefetchUnit(unitTextIn(queue, k, e), resolveVoice(voiceAtIn(qVoice, k), defVid));
             k = e;
             n++;
         }
         // 跨到下一章的前几个单元，章末切换时就不会再等合成
         if (n < PREFETCH_DEPTH && !qPending.isEmpty()) {
-            List<String> nx = qPending.get(0).s;
+            Seg nx = qPending.get(0);
             int j = Math.max(0, k - queue.size());
             int m = 0;
-            while (m < PREFETCH_DEPTH - n && j < nx.size()) {
-                int e = Math.min(unitEndIn(nx, j), nx.size());
-                prefetchUnit(unitTextIn(nx, j, e), v, isEdge);
+            while (m < PREFETCH_DEPTH - n && j < nx.s.size()) {
+                int e = Math.min(unitEndIn(nx.s, nx.v, j), nx.s.size());
+                prefetchUnit(unitTextIn(nx.s, j, e), resolveVoice(voiceAtIn(nx.v, j), defVid));
                 j = e;
                 m++;
             }
         }
     }
 
-    /** 按当前音色投递到对应引擎的预取通道 */
-    private void prefetchUnit(String text, String voiceShort, boolean isEdge) {
-        if (text == null || text.isEmpty()) return;
+    /** 空音色 = 跟随全局（旁白），解析成具体 id */
+    private static String resolveVoice(String v, String def) {
+        return (v == null || v.isEmpty() || "default".equals(v)) ? def : v;
+    }
+
+    /** 按单元音色投递到对应引擎的预取通道（多角色时相邻单元可能是不同音色、不同引擎） */
+    private void prefetchUnit(String text, String vid) {
+        if (text == null || text.isEmpty() || vid == null) return;
         try {
-            if (isEdge) edge.prefetch(text, voiceShort, rate);
-            else baidu.prefetch(text, rate);
+            if (vid.startsWith("edge:")) edge.prefetch(text, voiceShortName(vid), rate);
+            else if (vid.startsWith("baidu:")) baidu.prefetch(text, rate);
+            // 系统语音本地合成，无需预取
         } catch (Throwable ignore) { }
     }
 
     private volatile int qToken = 0;
+
+    /** 单句音色覆盖（试听用）：消费一次即清空 */
+    private volatile String qForceVoiceOnce = null;
 
     private void finishQueue() {
         qPlaying = false;

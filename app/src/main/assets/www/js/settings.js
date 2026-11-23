@@ -17,6 +17,8 @@ export const DEFAULTS = {
   ttsVoice: '',
   seamless: true,        // 句间无缝连读（原生层提前准备下一句）
   joinShort: true,       // 短句合并朗读（相邻短句凑一段合成，减少换句停顿）
+  multiRole: true,       // 多角色朗读（对白自动换音色，旁白用当前音色）
+  roleOverrides: {},     // { 'bookId|角色名': voiceId } 手动指定的角色音色，按书隔离
   timerMin: 0,
   sortBy: 'recent',       // recent | title | added
   catalogDesc: false,     // 目录是否倒序（最新章节在上）
